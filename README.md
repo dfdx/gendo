@@ -1,5 +1,5 @@
 # gendo
 
-[alt text](logo/gendo.jpg)
+![logo](logo/gendo.jpg)
 
 Generative models
