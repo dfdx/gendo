@@ -44,7 +44,7 @@ def main():
     )
     pipe.safety_checker = None
 
-    prompt = "a photo of a beautiful woman with an unmbrella on a bridge. highly detailed, trending on artstation"
+    prompt = "a beautiful woman on a bridge, close shot. highly detailed, trending on artstation"
 
     prng_seed = jax.random.PRNGKey(1)
     generate(pipe, params, prompt, prng_seed)

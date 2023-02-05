@@ -2,174 +2,133 @@ import os
 import random
 import PIL
 from PIL import Image
+from pathlib import Path
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 import torch
+from torch.utils.data import Dataset
 from torchvision import transforms
 
 
+class DreamBoothDataset(Dataset):
+    """
+    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
+    It pre-processes the images and the tokenizes prompts.
+    """
 
-# from https://jax.readthedocs.io/en/latest/notebooks/Neural_Network_and_Data_Loading.html
-# TODO: this doesn't seem to work for datasets with elements of type dict
-def numpy_collate(batch):
-    if isinstance(batch[0], np.ndarray):
-        return np.stack(batch)
-    elif isinstance(batch[0], (tuple,list)):
-        transposed = zip(*batch)
-        return [numpy_collate(samples) for samples in transposed]
-    else:
-        return np.array(batch)
-
-
-class NumpyLoader(torch.utils.data.DataLoader):
-    def __init__(self, dataset, batch_size=1,
-                    shuffle=False, sampler=None,
-                    batch_sampler=None, num_workers=0,
-                    pin_memory=False, drop_last=False,
-                    timeout=0, worker_init_fn=None):
-        super(self.__class__, self).__init__(dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            sampler=sampler,
-            batch_sampler=batch_sampler,
-            num_workers=num_workers,
-            collate_fn=numpy_collate,
-            pin_memory=pin_memory,
-            drop_last=drop_last,
-            timeout=timeout,
-            worker_init_fn=worker_init_fn)
-
-
-class FlattenAndCast(object):
-    def __call__(self, pic):
-        return np.ravel(np.array(pic, dtype=jnp.float32))
-
-
-class JaxDataset(torch.utils.data.Dataset):
-
-    def __init__(self, dataset):
-        self.dataset = dataset
-
-    def __getitem__(self, i):
-        item = self.dataset[i]
-        if not (isinstance(item, dict) or isinstance(item, list)):
-            raise AssertionError(f"Cannot convert to jax item of type {type(item)}")
-        return jax.tree_map(lambda t: jnp.asarray(t.numpy()), item)
-
-    def __len__(self):
-        return len(self.dataset)
-
-
-imagenet_templates_small = [
-    "a photo of a {}",
-    "a rendering of a {}",
-    "a cropped photo of the {}",
-    "the photo of a {}",
-    "a photo of a clean {}",
-    "a photo of a dirty {}",
-    "a dark photo of the {}",
-    "a photo of my {}",
-    "a photo of the cool {}",
-    "a close-up photo of a {}",
-    "a bright photo of the {}",
-    "a cropped photo of a {}",
-    "a photo of the {}",
-    "a good photo of the {}",
-    "a photo of one {}",
-    "a close-up photo of the {}",
-    "a rendition of the {}",
-    "a photo of the clean {}",
-    "a rendition of a {}",
-    "a photo of a nice {}",
-    "a good photo of a {}",
-    "a photo of the nice {}",
-    "a photo of the small {}",
-    "a photo of the weird {}",
-    "a photo of the large {}",
-    "a photo of a cool {}",
-    "a photo of a small {}",
-]
-
-
-class UnetTuningDataset(torch.utils.data.Dataset):
     def __init__(
         self,
-        data_root,
+        instance_data_root,
+        instance_prompt,
         tokenizer,
-        object_name,
-        templates=imagenet_templates_small,
+        class_data_root=None,
+        class_prompt=None,
         size=512,
-        repeats=100,
-        interpolation="bicubic",
-        flip_p=0.5,
-        set="train",
         center_crop=False,
     ):
-        self.data_root = data_root
-        self.tokenizer = tokenizer
-        self.placeholder_token = object_name
         self.size = size
         self.center_crop = center_crop
-        self.flip_p = flip_p
+        self.tokenizer = tokenizer
 
-        self.image_paths = [os.path.join(self.data_root, file_path) for file_path in os.listdir(self.data_root)]
+        self.instance_data_root = Path(instance_data_root)
+        if not self.instance_data_root.exists():
+            raise ValueError("Instance images root doesn't exists.")
 
-        self.num_images = len(self.image_paths)
-        self._length = self.num_images
+        self.instance_images_path = list(Path(instance_data_root).iterdir())
+        self.num_instance_images = len(self.instance_images_path)
+        self.instance_prompt = instance_prompt
+        self._length = self.num_instance_images
 
-        if set == "train":
-            self._length = self.num_images * repeats
+        if class_data_root is not None:
+            self.class_data_root = Path(class_data_root)
+            self.class_data_root.mkdir(parents=True, exist_ok=True)
+            self.class_images_path = list(self.class_data_root.iterdir())
+            self.num_class_images = len(self.class_images_path)
+            self._length = max(self.num_class_images, self.num_instance_images)
+            self.class_prompt = class_prompt
+        else:
+            self.class_data_root = None
 
-        self.interpolation = {
-            "linear": PIL.Image.LINEAR,
-            "bilinear": PIL.Image.BILINEAR,
-            "bicubic": PIL.Image.BICUBIC,
-            "lanczos": PIL.Image.LANCZOS,
-        }[interpolation]
-
-        self.flip_transform = transforms.RandomHorizontalFlip(p=self.flip_p)
-        self.templates = templates
+        self.image_transforms = transforms.Compose(
+            [
+                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
 
     def __len__(self):
         return self._length
 
-    def __getitem__(self, i):
+    def __getitem__(self, index):
         example = {}
-        image = Image.open(self.image_paths[i % self.num_images])
-
-        if not image.mode == "RGB":
-            image = image.convert("RGB")
-
-        placeholder_string = self.placeholder_token
-        text = random.choice(self.templates).format(placeholder_string)
-
-        example["input_ids"] = self.tokenizer(
-            text,
-            padding="max_length",
+        instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
+        if not instance_image.mode == "RGB":
+            instance_image = instance_image.convert("RGB")
+        example["instance_images"] = self.image_transforms(instance_image)
+        example["instance_prompt_ids"] = self.tokenizer(
+            self.instance_prompt,
+            padding="do_not_pad",
             truncation=True,
             max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
-        ).input_ids[0]
+        ).input_ids
 
-        # default to score-sde preprocessing
-        img = np.array(image).astype(np.uint8)
+        if self.class_data_root:
+            class_image = Image.open(self.class_images_path[index % self.num_class_images])
+            if not class_image.mode == "RGB":
+                class_image = class_image.convert("RGB")
+            example["class_images"] = self.image_transforms(class_image)
+            example["class_prompt_ids"] = self.tokenizer(
+                self.class_prompt,
+                padding="do_not_pad",
+                truncation=True,
+                max_length=self.tokenizer.model_max_length,
+            ).input_ids
 
-        if self.center_crop:
-            crop = min(img.shape[0], img.shape[1])
-            h, w, = (
-                img.shape[0],
-                img.shape[1],
-            )
-            img = img[(h - crop) // 2 : (h + crop) // 2, (w - crop) // 2 : (w + crop) // 2]
-
-        image = Image.fromarray(img)
-        image = image.resize((self.size, self.size), resample=self.interpolation)
-
-        image = self.flip_transform(image)
-        image = np.array(image).astype(np.uint8)
-        image = (image / 127.5 - 1.0).astype(np.float32)
-
-        example["pixel_values"] = torch.from_numpy(image).permute(2, 0, 1)
         return example
+
+
+class PromptDataset(Dataset):
+    "A simple dataset to prepare the prompts to generate class images on multiple GPUs."
+
+    def __init__(self, prompt, num_samples):
+        self.prompt = prompt
+        self.num_samples = num_samples
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, index):
+        example = {}
+        example["prompt"] = self.prompt
+        example["index"] = index
+        return example
+
+
+def collate_with_tokenizer(tokenizer, examples, with_prior_preservation=False):
+    input_ids = [example["instance_prompt_ids"] for example in examples]
+    pixel_values = [example["instance_images"] for example in examples]
+
+    # Concat class and instance examples for prior preservation.
+    # We do this to avoid doing two forward passes.
+    if with_prior_preservation:
+        input_ids += [example["class_prompt_ids"] for example in examples]
+        pixel_values += [example["class_images"] for example in examples]
+
+    pixel_values = torch.stack(pixel_values)
+    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+
+    input_ids = tokenizer.pad(
+        {"input_ids": input_ids}, padding="max_length", max_length=tokenizer.model_max_length, return_tensors="pt"
+    ).input_ids
+
+    batch = {
+        "input_ids": input_ids,
+        "pixel_values": pixel_values,
+    }
+    batch = {k: v.numpy() for k, v in batch.items()}
+    return batch
+

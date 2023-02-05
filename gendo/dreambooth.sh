@@ -1,5 +1,5 @@
 #!/bin/bash
-# export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:/usr/local/cuda-11/lib64:/usr/lib/x86_64-linux-gnu/
+# export LD_LIBRARY_PATH=/usr/local/cuda-11/lib64:/usr/lib/x86_64-linux-gnu/
 # export PATH=${PATH}:/usr/local/cuda/bin
 
 export MODEL_NAME="duongna/stable-diffusion-v1-4-flax"
