@@ -8,8 +8,7 @@ from diffusers import FlaxStableDiffusionPipeline
 
 SHOW_DIR = "_data/output/show"
 # MODEL_ID = "runwayml/stable-diffusion-v1-5"
-MODEL_ID = "_data/output/gulnara"
-
+MODEL_ID = "_data/models/gulnara"
 
 
 def generate(pipe, params, prompt, prng_seed):
@@ -28,8 +27,12 @@ def generate(pipe, params, prompt, prng_seed):
     os.makedirs(SHOW_DIR, exist_ok=True)
     for i in range(8):
         print(f"Generating {i}... ", end="")
-        images = pipe(prompt_ids, params, prng_seed, num_inference_steps, jit=True).images
-        images = pipe.numpy_to_pil(np.asarray(images.reshape((num_samples,) + images.shape[-3:])))
+        images = pipe(
+            prompt_ids, params, prng_seed, num_inference_steps, jit=True
+        ).images
+        images = pipe.numpy_to_pil(
+            np.asarray(images.reshape((num_samples,) + images.shape[-3:]))
+        )
         img = images[0]
         img_path = os.path.join(SHOW_DIR, f"{i}.jpg")
         print(f"Saving to {img_path}")
@@ -44,7 +47,7 @@ def main():
     )
     pipe.safety_checker = None
 
-    prompt = "a beautiful woman on a bridge, close shot. highly detailed, trending on artstation"
+    prompt = "photo of a beautiful woman in a medical mask. highly detailed, trending on artstation"
 
     prng_seed = jax.random.PRNGKey(1)
     generate(pipe, params, prompt, prng_seed)

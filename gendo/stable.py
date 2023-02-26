@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import logging
 import math
@@ -9,12 +10,13 @@ from functools import partial
 import numpy as np
 import torch
 import torch.utils.checkpoint
-
+from torch.utils.data import Dataset
 
 import jax
 import jax.numpy as jnp
 import optax
 import transformers
+from flax.jax_utils import replicate
 from diffusers import (
     FlaxAutoencoderKL,
     FlaxDDPMScheduler,
@@ -38,11 +40,9 @@ from transformers import (
     FlaxCLIPTextModel,
     set_seed,
 )
+
 from gendo.data import DreamBoothDataset, PromptDataset, collate_with_tokenizer
 
-
-# Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.13.0.dev0")
 
 # Cache compiled models across invocations of this script.
 cc.initialize_cache(os.path.expanduser("~/.cache/jax/compilation_cache"))
@@ -52,89 +52,6 @@ logger = logging.getLogger(__name__)
 
 def get_params_to_save(params):
     return jax.device_get(jax.tree_util.tree_map(lambda x: x[0], params))
-
-
-def train_step(
-    unet_state,
-    text_encoder_state,
-    vae,
-    vae_params,
-    noise_scheduler,
-    noise_scheduler_state,
-    batch,
-    train_rng,
-):
-    dropout_rng, sample_rng, new_train_rng = jax.random.split(train_rng, 3)
-    params = {"text_encoder": text_encoder_state.params, "unet": unet_state.params}
-
-    def compute_loss(params):
-        # Convert images to latent space
-        vae_outputs = vae.apply(
-            {"params": vae_params},
-            batch["pixel_values"],
-            deterministic=True,
-            method=vae.encode,
-        )
-        latents = vae_outputs.latent_dist.sample(sample_rng)
-        # (NHWC) -> (NCHW)
-        latents = jnp.transpose(latents, (0, 3, 1, 2))
-        latents = latents * vae.config.scaling_factor
-        # Sample noise that we'll add to the latents
-        noise_rng, timestep_rng = jax.random.split(sample_rng)
-        noise = jax.random.normal(noise_rng, latents.shape)
-        # Sample a random timestep for each image
-        bsz = latents.shape[0]
-        timesteps = jax.random.randint(
-            timestep_rng,
-            (bsz,),
-            0,
-            noise_scheduler.config.num_train_timesteps,
-        )
-        # Add noise to the latents according to the noise magnitude at each timestep
-        # (this is the forward diffusion process)
-        noisy_latents = noise_scheduler.add_noise(
-            noise_scheduler_state, latents, noise, timesteps
-        )
-
-        encoder_hidden_states = text_encoder_state.apply_fn(
-            batch["input_ids"],
-            params=params["text_encoder"],
-            dropout_rng=dropout_rng,
-            train=True,
-        )[0]
-        # Predict the noise residual
-        model_pred = unet.apply(
-            {"params": params["unet"]},
-            noisy_latents,
-            timesteps,
-            encoder_hidden_states,
-            train=True,
-        ).sample
-        # Get the target for loss depending on the prediction type
-        if noise_scheduler.config.prediction_type == "epsilon":
-            target = noise
-        elif noise_scheduler.config.prediction_type == "v_prediction":
-            target = noise_scheduler.get_velocity(
-                noise_scheduler_state, latents, noise, timesteps
-            )
-        else:
-            raise ValueError(
-                f"Unknown prediction type {noise_scheduler.config.prediction_type}"
-            )
-        loss = (target - model_pred) ** 2
-        loss = loss.mean()
-        return loss
-
-    grad_fn = jax.value_and_grad(compute_loss)
-    loss, grad = grad_fn(params)
-    grad = jax.lax.pmean(grad, "batch")
-    new_unet_state = unet_state.apply_gradients(grads=grad["unet"])
-    new_text_encoder_state = text_encoder_state.apply_gradients(
-        grads=grad["text_encoder"]
-    )
-    metrics = {"loss": loss}
-    metrics = jax.lax.pmean(metrics, axis_name="batch")
-    return new_unet_state, new_text_encoder_state, metrics, new_train_rng
 
 
 def create_dataloader(
@@ -155,14 +72,86 @@ def create_dataloader(
     return train_dataloader
 
 
-def main():
-    model_id = "runwayml/stable-diffusion-v1-5"
-    instance_data_dir = "_data/input/gulnara"
-    instance_prompt = "a photo of a beautiful woman"
-    revision = "flax"
-    seed = 1
-    batch_size = 1
-    learning_rate: float = 5e-6
+# def checkpoint(unet, unet_params, text_encoder, text_encoder_params, vae, vae_params, tokenizer, output_dir, step=None):
+#     # Create the pipeline using the trained modules and save it.
+#     scheduler, _ = FlaxPNDMScheduler.from_pretrained(
+#         "CompVis/stable-diffusion-v1-4", subfolder="scheduler"
+#     )
+#     safety_checker = FlaxStableDiffusionSafetyChecker.from_pretrained(
+#         "CompVis/stable-diffusion-safety-checker", from_pt=True
+#     )
+#     pipeline = FlaxStableDiffusionPipeline(
+#         text_encoder=text_encoder,
+#         vae=vae,
+#         unet=unet,
+#         tokenizer=tokenizer,
+#         scheduler=scheduler,
+#         safety_checker=safety_checker,
+#         feature_extractor=CLIPFeatureExtractor.from_pretrained(
+#             "openai/clip-vit-base-patch32"
+#         ),
+#     )
+
+#     outdir = os.path.join(output_dir, str(step)) if step else output_dir
+#     pipeline.save_pretrained(
+#         outdir,
+#         params={
+#             "text_encoder": get_params_to_save(text_encoder_params),
+#             "vae": get_params_to_save(vae_params),
+#             "unet": get_params_to_save(unet_params),
+#             "safety_checker": safety_checker.params,
+#         },
+#     )
+
+
+def create_train_state(unet, unet_params, text_encoder, text_encoder_params):
+    params = module.init(rng, jnp.ones([1, 28, 28, 1]))["params"]
+    tx = optax.sgd(learning_rate, momentum)
+    return TrainState.create(
+        apply_fn=module.apply, params=params, tx=tx,
+        metrics=Metrics.empty())
+
+
+def pipeline_and_params(
+    unet,
+    unet_params,
+    text_encoder,
+    text_encoder_params,
+    vae,
+    vae_params,
+    noise_scheduler,         # not used?
+    noise_scheduler_state,   # not used?
+    tokenizer,
+):
+    # Create the pipeline using the trained modules and save it.
+    # surprise, surprise! pipeline._generate doesn't work with the DDPM scheduler,
+    # so we have to use another one here
+    noise_scheduler, noise_scheduler_state = FlaxPNDMScheduler.from_pretrained(
+        # TODO: parametrize with actual model ID?
+        "CompVis/stable-diffusion-v1-4", subfolder="scheduler"
+    )
+    safety_checker = FlaxStableDiffusionSafetyChecker.from_pretrained(
+        "CompVis/stable-diffusion-safety-checker", from_pt=True
+    )
+    pipeline = FlaxStableDiffusionPipeline(
+        text_encoder=text_encoder,
+        vae=vae,
+        unet=unet,
+        tokenizer=tokenizer,
+        scheduler=noise_scheduler,
+        safety_checker=safety_checker,
+        feature_extractor=CLIPFeatureExtractor.from_pretrained(
+            "openai/clip-vit-base-patch32"
+        ),
+    )
+    params = {
+        "text_encoder": get_params_to_save(text_encoder_params),
+        "vae": get_params_to_save(vae_params),
+        "unet": get_params_to_save(unet_params),
+        "scheduler": noise_scheduler_state,
+        "safety_checker": safety_checker.params,
+    }
+    return pipeline, params
 
 
 def train(
@@ -173,7 +162,11 @@ def train(
     seed: int = 1,
     batch_size: int = 1,
     learning_rate: float = 5e-6,
+    train_text_encoder: bool = False,
+    num_train_epochs=50,
 ):
+    set_seed(seed)
+
     tokenizer = CLIPTokenizer.from_pretrained(
         model_id, subfolder="tokenizer", revision=revision
     )
@@ -227,270 +220,10 @@ def train(
     # Initialize our training
     train_rngs = jax.random.split(rng, jax.local_device_count())
 
-    # Create parallel version of the train step
-    p_train_step = jax.pmap(train_step, "batch", donate_argnums=(0, 1))
-
-    # Replicate the train state on each device
-    unet_state = jax_utils.replicate(unet_state)
-    text_encoder_state = jax_utils.replicate(text_encoder_state)
-    vae_params = jax_utils.replicate(vae_params)
-
-    global_step = 0
-
-    epochs = tqdm(range(100), desc="Epoch ... ", position=0)
-    for epoch in epochs:
-        train_metrics = []
-        # train
-        for batch in train_dataloader:
-            batch = shard(batch)
-            unet_state, text_encoder_state, train_metric, train_rngs = p_train_step(
-                unet,
-                unet_state,
-                text_encoder,
-                text_encoder_state,
-                vae,
-                vae_params,
-                noise_scheduler,
-                noise_scheduler_state,
-                batch,
-                train_rngs,
-            )
-            train_metrics.append(train_metric)
-            global_step += 1
-        train_metric = jax_utils.unreplicate(train_metric)
-
-
-def main():
-    args = parse_args()
-
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
-    # Setup logging, we only want one process per machine to log things on the screen.
-    logger.setLevel(logging.INFO if jax.process_index() == 0 else logging.ERROR)
-    if jax.process_index() == 0:
-        transformers.utils.logging.set_verbosity_info()
-    else:
-        transformers.utils.logging.set_verbosity_error()
-
-    if args.seed is not None:
-        set_seed(args.seed)
-
-    rng = jax.random.PRNGKey(args.seed)
-
-    if args.with_prior_preservation:
-        class_images_dir = Path(args.class_data_dir)
-        if not class_images_dir.exists():
-            class_images_dir.mkdir(parents=True)
-        cur_class_images = len(list(class_images_dir.iterdir()))
-
-        if cur_class_images < args.num_class_images:
-            pipeline, params = FlaxStableDiffusionPipeline.from_pretrained(
-                args.pretrained_model_name_or_path,
-                safety_checker=None,
-                revision=args.revision,
-            )
-            pipeline.set_progress_bar_config(disable=True)
-
-            num_new_images = args.num_class_images - cur_class_images
-            logger.info(f"Number of class images to sample: {num_new_images}.")
-
-            sample_dataset = PromptDataset(args.class_prompt, num_new_images)
-            total_sample_batch_size = args.sample_batch_size * jax.local_device_count()
-            sample_dataloader = torch.utils.data.DataLoader(
-                sample_dataset, batch_size=total_sample_batch_size
-            )
-
-            for example in tqdm(
-                sample_dataloader,
-                desc="Generating class images",
-                disable=not jax.process_index() == 0,
-            ):
-                prompt_ids = pipeline.prepare_inputs(example["prompt"])
-                prompt_ids = shard(prompt_ids)
-                p_params = jax_utils.replicate(params)
-                rng = jax.random.split(rng)[0]
-                sample_rng = jax.random.split(rng, jax.device_count())
-                images = pipeline(prompt_ids, p_params, sample_rng, jit=True).images
-                images = images.reshape(
-                    (images.shape[0] * images.shape[1],) + images.shape[-3:]
-                )
-                images = pipeline.numpy_to_pil(np.array(images))
-
-                for i, image in enumerate(images):
-                    hash_image = hashlib.sha1(image.tobytes()).hexdigest()
-                    image_filename = (
-                        class_images_dir
-                        / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
-                    )
-                    image.save(image_filename)
-
-            del pipeline
-
-    # Handle the repository creation
-    if jax.process_index() == 0:
-        if args.push_to_hub:
-            if args.hub_model_id is None:
-                repo_name = get_full_repo_name(
-                    Path(args.output_dir).name, token=args.hub_token
-                )
-            else:
-                repo_name = args.hub_model_id
-            create_repo(repo_name, exist_ok=True, token=args.hub_token)
-            repo = Repository(
-                args.output_dir, clone_from=repo_name, token=args.hub_token
-            )
-
-            with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
-                if "step_*" not in gitignore:
-                    gitignore.write("step_*\n")
-                if "epoch_*" not in gitignore:
-                    gitignore.write("epoch_*\n")
-        elif args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
-
-    # Load the tokenizer and add the placeholder token as a additional special token
-    if args.tokenizer_name:
-        tokenizer = CLIPTokenizer.from_pretrained(args.tokenizer_name)
-    elif args.pretrained_model_name_or_path:
-        tokenizer = CLIPTokenizer.from_pretrained(
-            args.pretrained_model_name_or_path,
-            subfolder="tokenizer",
-            revision=args.revision,
-        )
-    else:
-        raise NotImplementedError("No tokenizer specified!")
-
-    train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_prompt=args.class_prompt,
-        tokenizer=tokenizer,
-        size=args.resolution,
-        center_crop=args.center_crop,
-    )
-
-    def collate_fn(examples):
-        input_ids = [example["instance_prompt_ids"] for example in examples]
-        pixel_values = [example["instance_images"] for example in examples]
-
-        # Concat class and instance examples for prior preservation.
-        # We do this to avoid doing two forward passes.
-        if args.with_prior_preservation:
-            input_ids += [example["class_prompt_ids"] for example in examples]
-            pixel_values += [example["class_images"] for example in examples]
-
-        pixel_values = torch.stack(pixel_values)
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
-        input_ids = tokenizer.pad(
-            {"input_ids": input_ids},
-            padding="max_length",
-            max_length=tokenizer.model_max_length,
-            return_tensors="pt",
-        ).input_ids
-
-        batch = {
-            "input_ids": input_ids,
-            "pixel_values": pixel_values,
-        }
-        batch = {k: v.numpy() for k, v in batch.items()}
-        return batch
-
-    total_train_batch_size = args.train_batch_size * jax.local_device_count()
-    if len(train_dataset) < total_train_batch_size:
-        raise ValueError(
-            f"Training batch size is {total_train_batch_size}, but your dataset only contains"
-            f" {len(train_dataset)} images. Please, use a larger dataset or reduce the effective batch size. Note that"
-            f" there are {jax.local_device_count()} parallel devices, so your batch size can't be smaller than that."
-        )
-
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=total_train_batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        drop_last=True,
-    )
-
-    weight_dtype = jnp.float32
-    if args.mixed_precision == "fp16":
-        weight_dtype = jnp.float16
-    elif args.mixed_precision == "bf16":
-        weight_dtype = jnp.bfloat16
-
-    if args.pretrained_vae_name_or_path:
-        # TODO(patil-suraj): Upload flax weights for the VAE
-        vae_arg, vae_kwargs = (args.pretrained_vae_name_or_path, {"from_pt": True})
-    else:
-        vae_arg, vae_kwargs = (
-            args.pretrained_model_name_or_path,
-            {"subfolder": "vae", "revision": args.revision},
-        )
-
-    # Load models and create wrapper for stable diffusion
-    text_encoder = FlaxCLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="text_encoder",
-        dtype=weight_dtype,
-        revision=args.revision,
-    )
-    vae, vae_params = FlaxAutoencoderKL.from_pretrained(
-        vae_arg,
-        dtype=weight_dtype,
-        **vae_kwargs,
-    )
-    unet, unet_params = FlaxUNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="unet",
-        dtype=weight_dtype,
-        revision=args.revision,
-    )
-
-    # Optimization
-    if args.scale_lr:
-        args.learning_rate = args.learning_rate * total_train_batch_size
-
-    constant_scheduler = optax.constant_schedule(args.learning_rate)
-
-    adamw = optax.adamw(
-        learning_rate=constant_scheduler,
-        b1=args.adam_beta1,
-        b2=args.adam_beta2,
-        eps=args.adam_epsilon,
-        weight_decay=args.adam_weight_decay,
-    )
-
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(args.max_grad_norm),
-        adamw,
-    )
-
-    unet_state = train_state.TrainState.create(
-        apply_fn=unet.__call__, params=unet_params, tx=optimizer
-    )
-    text_encoder_state = train_state.TrainState.create(
-        apply_fn=text_encoder.__call__, params=text_encoder.params, tx=optimizer
-    )
-
-    noise_scheduler = FlaxDDPMScheduler(
-        beta_start=0.00085,
-        beta_end=0.012,
-        beta_schedule="scaled_linear",
-        num_train_timesteps=1000,
-    )
-    noise_scheduler_state = noise_scheduler.create_state()
-
-    # Initialize our training
-    train_rngs = jax.random.split(rng, jax.local_device_count())
-
     def train_step(unet_state, text_encoder_state, vae_params, batch, train_rng):
         dropout_rng, sample_rng, new_train_rng = jax.random.split(train_rng, 3)
 
-        if args.train_text_encoder:
+        if train_text_encoder:
             params = {
                 "text_encoder": text_encoder_state.params,
                 "unet": unet_state.params,
@@ -529,8 +262,7 @@ def main():
                 noise_scheduler_state, latents, noise, timesteps
             )
 
-            # Get the text embedding for conditioning
-            if args.train_text_encoder:
+            if train_text_encoder:
                 encoder_hidden_states = text_encoder_state.apply_fn(
                     batch["input_ids"],
                     params=params["text_encoder"],
@@ -563,25 +295,8 @@ def main():
                     f"Unknown prediction type {noise_scheduler.config.prediction_type}"
                 )
 
-            if args.with_prior_preservation:
-                # Chunk the noise and noise_pred into two parts and compute the loss on each part separately.
-                model_pred, model_pred_prior = jnp.split(model_pred, 2, axis=0)
-                target, target_prior = jnp.split(target, 2, axis=0)
-
-                # Compute instance loss
-                loss = (target - model_pred) ** 2
-                loss = loss.mean()
-
-                # Compute prior loss
-                prior_loss = (target_prior - model_pred_prior) ** 2
-                prior_loss = prior_loss.mean()
-
-                # Add the prior loss to the instance loss.
-                loss = loss + args.prior_loss_weight * prior_loss
-            else:
-                loss = (target - model_pred) ** 2
-                loss = loss.mean()
-
+            loss = (target - model_pred) ** 2
+            loss = loss.mean()
             return loss
 
         grad_fn = jax.value_and_grad(compute_loss)
@@ -589,7 +304,7 @@ def main():
         grad = jax.lax.pmean(grad, "batch")
 
         new_unet_state = unet_state.apply_gradients(grads=grad["unet"])
-        if args.train_text_encoder:
+        if train_text_encoder:
             new_text_encoder_state = text_encoder_state.apply_gradients(
                 grads=grad["text_encoder"]
             )
@@ -609,70 +324,14 @@ def main():
     text_encoder_state = jax_utils.replicate(text_encoder_state)
     vae_params = jax_utils.replicate(vae_params)
 
-    # Train!
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader))
+    # global_step = 0
 
-    # Scheduler and math around the number of training steps.
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(
-        f"  Total train batch size (w. parallel & distributed) = {total_train_batch_size}"
-    )
-    logger.info(f"  Total optimization steps = {args.max_train_steps}")
-
-    def checkpoint(step=None):
-        # Create the pipeline using the trained modules and save it.
-        scheduler, _ = FlaxPNDMScheduler.from_pretrained(
-            "CompVis/stable-diffusion-v1-4", subfolder="scheduler"
-        )
-        safety_checker = FlaxStableDiffusionSafetyChecker.from_pretrained(
-            "CompVis/stable-diffusion-safety-checker", from_pt=True
-        )
-        pipeline = FlaxStableDiffusionPipeline(
-            text_encoder=text_encoder,
-            vae=vae,
-            unet=unet,
-            tokenizer=tokenizer,
-            scheduler=scheduler,
-            safety_checker=safety_checker,
-            feature_extractor=CLIPFeatureExtractor.from_pretrained(
-                "openai/clip-vit-base-patch32"
-            ),
-        )
-
-        outdir = os.path.join(args.output_dir, str(step)) if step else args.output_dir
-        pipeline.save_pretrained(
-            outdir,
-            params={
-                "text_encoder": get_params_to_save(text_encoder_state.params),
-                "vae": get_params_to_save(vae_params),
-                "unet": get_params_to_save(unet_state.params),
-                "safety_checker": safety_checker.params,
-            },
-        )
-
-        if args.push_to_hub:
-            message = f"checkpoint-{step}" if step is not None else "End of training"
-            repo.push_to_hub(
-                commit_message=message, blocking=False, auto_lfs_prune=True
-            )
-
-    global_step = 0
-
-    epochs = tqdm(range(args.num_train_epochs), desc="Epoch ... ", position=0)
+    total_train_batch_size = batch_size * jax.local_device_count()
+    epochs = tqdm(range(num_train_epochs), desc="Epoch ... ", position=0)
     for epoch in epochs:
         # ======================== Training ================================
-
         train_metrics = []
-
-        steps_per_epoch = len(train_dataset) // total_train_batch_size
+        steps_per_epoch = len(train_dataloader.dataset) // total_train_batch_size
         train_step_progress_bar = tqdm(
             total=steps_per_epoch, desc="Training...", position=1, leave=False
         )
@@ -683,29 +342,108 @@ def main():
                 unet_state, text_encoder_state, vae_params, batch, train_rngs
             )
             train_metrics.append(train_metric)
-
             train_step_progress_bar.update(jax.local_device_count())
-
-            global_step += 1
-            if (
-                jax.process_index() == 0
-                and args.save_steps
-                and global_step % args.save_steps == 0
-            ):
-                checkpoint(global_step)
-            if global_step >= args.max_train_steps:
-                break
-
+            # global_step += 1
         train_metric = jax_utils.unreplicate(train_metric)
-
         train_step_progress_bar.close()
         epochs.write(
-            f"Epoch... ({epoch + 1}/{args.num_train_epochs} | Loss: {train_metric['loss']})"
+            f"Epoch... ({epoch + 1}/{num_train_epochs} | Loss: {train_metric['loss']})"
         )
+    # if jax.process_index() == 0:
+    #     checkpoint(unet, unet_state.params, text_encoder, text_encoder_state.params, vae, vae_params, tokenizer, output_dir)
+    return pipeline_and_params(
+        unet,
+        unet_state.params,
+        text_encoder,
+        text_encoder_state.params,
+        vae,
+        vae_params,
+        noise_scheduler,
+        noise_scheduler_state,
+        tokenizer,
+    )
 
-    if jax.process_index() == 0:
-        checkpoint()
+
+def generate(pipeline, params, prompt, prng_seed=None):
+    pipeline.safety_checker = None
+    if prng_seed is None:
+        prng_seed = jax.random.PRNGKey(1)
+    num_inference_steps = 50
+
+    num_samples = jax.device_count()
+    prompt = num_samples * [prompt]
+    prompt_ids = pipeline.prepare_inputs(prompt)
+
+    # shard inputs and rng
+    params = replicate(params)
+    prng_seed = jax.random.split(prng_seed, jax.device_count())
+    # prng_seed = jax.random.split(prng_seed, num_samples)
+    prompt_ids = shard(prompt_ids)
+
+    SHOW_DIR = "_data/output/show"
+    os.makedirs(SHOW_DIR, exist_ok=True)
+    for i in range(8):
+        print(f"Generating {i}... ", end="")
+        images = pipeline(
+            prompt_ids, params, prng_seed, num_inference_steps, jit=True
+        ).images
+        images = pipeline.numpy_to_pil(
+            np.asarray(images.reshape((num_samples,) + images.shape[-3:]))
+        )
+        img = images[0]
+        img_path = os.path.join(SHOW_DIR, f"{i}.jpg")
+        print(f"Saving to {img_path}")
+        img.save(img_path)
+        # TODO: figure out how to pass multiple PRNG in one hop
+        prng_seed = jax.random.split(prng_seed[0], 1)
 
 
-if __name__ == "__main__" and "__file__" in globals():
-    main()
+class FlaxStableDiffusion:
+    def __init__(self, pipeline, params):
+        self.pipeline = pipeline
+        self.params = params
+
+    def predict(self, prompt, prng_seed=None):
+        return generate(self.pipeline, self.params, prompt, prng_seed)
+
+    @staticmethod
+    def fit(*args, **kwargs):
+        pipeline, params = train(*args, **kwargs)
+        return FlaxStableDiffusion(pipeline, params)
+
+    def save(self, path):
+        self.pipeline.save_pretrained(path, params=self.params)
+
+    @classmethod
+    def load(cls, path):
+        pipeline, params = FlaxStableDiffusionPipeline.from_pretrained(
+            path, revision="flax", dtype=jax.numpy.bfloat16
+        )
+        return FlaxStableDiffusion(pipeline, params)
+
+
+def main():
+    model_id = "runwayml/stable-diffusion-v1-5"
+    instance_data_dir = "_data/input/gulnara"
+    instance_prompt = "a photo of a beautiful woman"
+    output_dir = "_data/models/gulnara"
+    revision = "flax"
+    seed = 1
+    batch_size = 1
+    learning_rate: float = 5e-6
+    train_text_encoder = True
+    num_train_epochs = 50
+    model = FlaxStableDiffusion.fit(
+        model_id,
+        instance_data_dir,
+        instance_prompt,
+        revision=revision,
+        seed=seed,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        train_text_encoder=train_text_encoder,
+        num_train_epochs=num_train_epochs,
+    )
+    model.save(output_dir)
+    model = FlaxStableDiffusion.load(output_dir)
+    model.predict("a beautiful man with drums on a moon")
