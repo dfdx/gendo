@@ -16,5 +16,5 @@ RUN pip install ipython
 
 RUN mkdir -p /root/.cache
 
-RUN echo 'LD_LIBRARY_PATH=/usr/local/cuda-11/lib64:/usr/lib/x86_64-linux-gnu/:${LD_LIBRARY_PATH}' >> /root/.bashrc
-RUN echo 'PATH=/usr/local/cuda/bin:${PATH}' >> /root/.bashrc
+RUN echo 'export LD_LIBRARY_PATH=/usr/local/cuda-11/lib64:/usr/lib/x86_64-linux-gnu/:${LD_LIBRARY_PATH}' >> /root/.bashrc
+RUN echo 'export PATH=/usr/local/cuda/bin:${PATH}' >> /root/.bashrc
