@@ -75,6 +75,7 @@ def create_dataloader(
 
 class TrainState(train_state.TrainState):
     noise_scheduler_state: Any
+    train_text_encoder: bool
 
 
 def create_train_state(
@@ -82,6 +83,7 @@ def create_train_state(
     text_encoder_params,
     vae_params,
     noise_scheduler_state,
+    train_text_encoder: bool = False,
     learning_rate: float = 5e-6,
 ):
     params = {
@@ -106,6 +108,7 @@ def create_train_state(
         apply_fn=None,
         params=params,
         tx=optimizer,
+        train_text_encoder=train_text_encoder,
         noise_scheduler_state=noise_scheduler_state,
     )
 
@@ -150,17 +153,23 @@ def train_step(models, state, batch, train_rng):
             state.noise_scheduler_state, latents, noise, timesteps
         )
 
-        if state.train_text_encoder:
-            encoder_hidden_states = text_encoder_state.apply_fn(
-                batch["input_ids"],
-                params=params["text_encoder"],
-                dropout_rng=dropout_rng,
-                train=True,
-            )[0]
-        else:
-            encoder_hidden_states = text_encoder(
-                batch["input_ids"], params=text_encoder_state.params, train=False
-            )[0]
+        encoder_hidden_states = models["text_encoder"](
+            batch["input_ids"],
+            params=params["text_encoder"],
+            dropout_rng=dropout_rng,
+            train=True,
+        )[0]
+        # if state.train_text_encoder:
+        #     encoder_hidden_states = text_encoder_state.apply_fn(
+        #         batch["input_ids"],
+        #         params=params["text_encoder"],
+        #         dropout_rng=dropout_rng,
+        #         train=True,
+        #     )[0]
+        # else:
+        #     encoder_hidden_states = text_encoder(
+        #         batch["input_ids"], params=text_encoder_state.params, train=False
+        #     )[0]
 
         # Predict the noise residual
         model_pred = unet.apply(
@@ -176,7 +185,7 @@ def train_step(models, state, batch, train_rng):
             target = noise
         elif noise_scheduler.config.prediction_type == "v_prediction":
             target = noise_scheduler.get_velocity(
-                noise_scheduler_state, latents, noise, timesteps
+                state.noise_scheduler_state, latents, noise, timesteps
             )
         else:
             raise ValueError(
@@ -275,7 +284,7 @@ def train(
     train_dataloader = create_dataloader(
         instance_data_dir, instance_prompt, tokenizer, batch_size=batch_size
     )
-    weight_dtype = jnp.float32
+    weight_dtype = jnp.float32  # TODO: use float16 and .to_fp16() on parameters
 
     # Load models
     text_encoder = FlaxCLIPTextModel.from_pretrained(
@@ -292,24 +301,24 @@ def train(
     )
 
     # Optimization
-    constant_scheduler = optax.constant_schedule(learning_rate)
-    adamw = optax.adamw(
-        learning_rate=constant_scheduler,
-        b1=0.9,
-        b2=0.999,
-        eps=1e-08,
-        weight_decay=1e-2,
-    )
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        adamw,
-    )
-    unet_state = train_state.TrainState.create(
-        apply_fn=unet.__call__, params=unet_params, tx=optimizer
-    )
-    text_encoder_state = train_state.TrainState.create(
-        apply_fn=text_encoder.__call__, params=text_encoder.params, tx=optimizer
-    )
+    # constant_scheduler = optax.constant_schedule(learning_rate)
+    # adamw = optax.adamw(
+    #     learning_rate=constant_scheduler,
+    #     b1=0.9,
+    #     b2=0.999,
+    #     eps=1e-08,
+    #     weight_decay=1e-2,
+    # )
+    # optimizer = optax.chain(
+    #     optax.clip_by_global_norm(1.0),
+    #     adamw,
+    # )
+    # unet_state = train_state.TrainState.create(
+    #     apply_fn=unet.__call__, params=unet_params, tx=optimizer
+    # )
+    # text_encoder_state = train_state.TrainState.create(
+    #     apply_fn=text_encoder.__call__, params=text_encoder.params, tx=optimizer
+    # )
     noise_scheduler = FlaxDDPMScheduler(
         beta_start=0.00085,
         beta_end=0.012,
@@ -335,111 +344,24 @@ def train(
         "noise_scheduler": noise_scheduler,
     }
 
-    p_train_step = jax.pmap(partial(train_step, models))(state, batch, train_rngs)
 
-    # def train_step(unet_state, text_encoder_state, vae_params, batch, train_rng):
-    #     dropout_rng, sample_rng, new_train_rng = jax.random.split(train_rng, 3)
 
-    #     if train_text_encoder:
-    #         params = {
-    #             "text_encoder": text_encoder_state.params,
-    #             "unet": unet_state.params,
-    #         }
-    #     else:
-    #         params = {"unet": unet_state.params}
-
-    #     def compute_loss(params):
-    #         # Convert images to latent space
-    #         vae_outputs = vae.apply(
-    #             {"params": vae_params},
-    #             batch["pixel_values"],
-    #             deterministic=True,
-    #             method=vae.encode,
-    #         )
-    #         latents = vae_outputs.latent_dist.sample(sample_rng)
-    #         # (NHWC) -> (NCHW)
-    #         latents = jnp.transpose(latents, (0, 3, 1, 2))
-    #         latents = latents * vae.config.scaling_factor
-
-    #         # Sample noise that we'll add to the latents
-    #         noise_rng, timestep_rng = jax.random.split(sample_rng)
-    #         noise = jax.random.normal(noise_rng, latents.shape)
-    #         # Sample a random timestep for each image
-    #         bsz = latents.shape[0]
-    #         timesteps = jax.random.randint(
-    #             timestep_rng,
-    #             (bsz,),
-    #             0,
-    #             noise_scheduler.config.num_train_timesteps,
-    #         )
-
-    #         # Add noise to the latents according to the noise magnitude at each timestep
-    #         # (this is the forward diffusion process)
-    #         noisy_latents = noise_scheduler.add_noise(
-    #             noise_scheduler_state, latents, noise, timesteps
-    #         )
-
-    #         if train_text_encoder:
-    #             encoder_hidden_states = text_encoder_state.apply_fn(
-    #                 batch["input_ids"],
-    #                 params=params["text_encoder"],
-    #                 dropout_rng=dropout_rng,
-    #                 train=True,
-    #             )[0]
-    #         else:
-    #             encoder_hidden_states = text_encoder(
-    #                 batch["input_ids"], params=text_encoder_state.params, train=False
-    #             )[0]
-
-    #         # Predict the noise residual
-    #         model_pred = unet.apply(
-    #             {"params": params["unet"]},
-    #             noisy_latents,
-    #             timesteps,
-    #             encoder_hidden_states,
-    #             train=True,
-    #         ).sample
-
-    #         # Get the target for loss depending on the prediction type
-    #         if noise_scheduler.config.prediction_type == "epsilon":
-    #             target = noise
-    #         elif noise_scheduler.config.prediction_type == "v_prediction":
-    #             target = noise_scheduler.get_velocity(
-    #                 noise_scheduler_state, latents, noise, timesteps
-    #             )
-    #         else:
-    #             raise ValueError(
-    #                 f"Unknown prediction type {noise_scheduler.config.prediction_type}"
-    #             )
-
-    #         loss = (target - model_pred) ** 2
-    #         loss = loss.mean()
-    #         return loss
-
-    #     grad_fn = jax.value_and_grad(compute_loss)
-    #     loss, grad = grad_fn(params)
-    #     grad = jax.lax.pmean(grad, "batch")
-
-    #     new_unet_state = unet_state.apply_gradients(grads=grad["unet"])
-    #     if train_text_encoder:
-    #         new_text_encoder_state = text_encoder_state.apply_gradients(
-    #             grads=grad["text_encoder"]
-    #         )
-    #     else:
-    #         new_text_encoder_state = text_encoder_state
-
-    #     metrics = {"loss": loss}
-    #     metrics = jax.lax.pmean(metrics, axis_name="batch")
-
-    #     return new_unet_state, new_text_encoder_state, metrics, new_train_rng
+    batch = next(iter(train_dataloader))
 
     # Create parallel version of the train step
-    p_train_step = jax.pmap(train_step, "batch", donate_argnums=(0, 1))
+    # p_train_step = jax.pmap(train_step, "batch", donate_argnums=(0, 1))
+    p_train_step = jax.pmap(partial(train_step, models), "batch")
+
 
     # Replicate the train state on each device
-    unet_state = jax_utils.replicate(unet_state)
-    text_encoder_state = jax_utils.replicate(text_encoder_state)
-    vae_params = jax_utils.replicate(vae_params)
+    # unet_state = jax_utils.replicate(unet_state)
+    # text_encoder_state = jax_utils.replicate(text_encoder_state)
+    # vae_params = jax_utils.replicate(vae_params)
+
+    p_state = jax_utils.replicate(state)
+    p_batch = shard(batch)
+    p_train_step(p_state, p_batch, train_rngs)
+
 
     # global_step = 0
 
