@@ -113,7 +113,7 @@ def create_train_state(
     )
 
 
-def train_step(models, state, batch, train_rng):
+def train_step(models: dict, state: TrainState, batch, train_rng):
     dropout_rng, sample_rng, new_train_rng = jax.random.split(train_rng, 3)
     text_encoder, vae, unet, noise_scheduler = (
         models["text_encoder"],
@@ -197,8 +197,8 @@ def train_step(models, state, batch, train_rng):
         return loss
 
     grad_fn = jax.value_and_grad(loss_fn)
-    loss, grad = grad_fn(state.params)  # TODO: use only trainable parameters
-    grad = jax.lax.pmean(grad, "batch")
+    loss, grads = grad_fn(state.params)  # TODO: use only trainable parameters
+    grads = jax.lax.pmean(grads, "batch")
 
     # new_unet_state = unet_state.apply_gradients(grads=grad["unet"])
     # if train_text_encoder:
@@ -212,7 +212,7 @@ def train_step(models, state, batch, train_rng):
     metrics = jax.lax.pmean(metrics, axis_name="batch")
 
     # return new_unet_state, new_text_encoder_state, metrics, new_train_rng
-    return state
+    return state.apply_gradients(grads=grads)
 
 
 # class LatentDiffusionTrainer(nn.Module):
@@ -300,25 +300,6 @@ def train(
         model_id, subfolder="unet", dtype=weight_dtype, revision=revision
     )
 
-    # Optimization
-    # constant_scheduler = optax.constant_schedule(learning_rate)
-    # adamw = optax.adamw(
-    #     learning_rate=constant_scheduler,
-    #     b1=0.9,
-    #     b2=0.999,
-    #     eps=1e-08,
-    #     weight_decay=1e-2,
-    # )
-    # optimizer = optax.chain(
-    #     optax.clip_by_global_norm(1.0),
-    #     adamw,
-    # )
-    # unet_state = train_state.TrainState.create(
-    #     apply_fn=unet.__call__, params=unet_params, tx=optimizer
-    # )
-    # text_encoder_state = train_state.TrainState.create(
-    #     apply_fn=text_encoder.__call__, params=text_encoder.params, tx=optimizer
-    # )
     noise_scheduler = FlaxDDPMScheduler(
         beta_start=0.00085,
         beta_end=0.012,
@@ -377,30 +358,32 @@ def train(
         # train
         for batch in train_dataloader:
             batch = shard(batch)
-            unet_state, text_encoder_state, train_metric, train_rngs = p_train_step(
-                unet_state, text_encoder_state, vae_params, batch, train_rngs
-            )
-            train_metrics.append(train_metric)
+            p_state = p_train_step(p_state, p_batch, train_rngs)
+            # train_metrics.append(train_metric)
             train_step_progress_bar.update(jax.local_device_count())
             # global_step += 1
-        train_metric = jax_utils.unreplicate(train_metric)
+        # train_metric = jax_utils.unreplicate(train_metric)
         train_step_progress_bar.close()
         epochs.write(
-            f"Epoch... ({epoch + 1}/{num_train_epochs} | Loss: {train_metric['loss']})"
+            f"Epoch... ({epoch + 1}/{num_train_epochs} | Loss: ...)"
         )
+        # epochs.write(
+        #     f"Epoch... ({epoch + 1}/{num_train_epochs} | Loss: {train_metric['loss']})"
+        # )
     # if jax.process_index() == 0:
     #     checkpoint(unet, unet_state.params, text_encoder, text_encoder_state.params, vae, vae_params, tokenizer, output_dir)
-    return pipeline_and_params(
-        unet,
-        unet_state.params,
-        text_encoder,
-        text_encoder_state.params,
-        vae,
-        vae_params,
-        noise_scheduler,
-        noise_scheduler_state,
-        tokenizer,
-    )
+    # return pipeline_and_params(
+    #     unet,
+    #     unet_state.params,
+    #     text_encoder,
+    #     text_encoder_state.params,
+    #     vae,
+    #     vae_params,
+    #     noise_scheduler,
+    #     noise_scheduler_state,
+    #     tokenizer,
+    # )
+    return state
 
 
 def generate(pipeline, params, prompt, prng_seed=None):
