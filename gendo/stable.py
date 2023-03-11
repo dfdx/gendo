@@ -355,38 +355,68 @@ def train(
     return pipeline_and_params(models, unreplicate(p_state), tokenizer)
 
 
-def generate(pipeline, params, prompt, prng_seed=None):
+def generate(pipeline: FlaxStableDiffusionPipeline, params, prompts: list[str], prng_seed=None):
     pipeline.safety_checker = None
     if prng_seed is None:
         prng_seed = jax.random.PRNGKey(1)
     num_inference_steps = 50
 
-    num_samples = jax.device_count()
-    prompt = num_samples * [prompt]
-    prompt_ids = pipeline.prepare_inputs(prompt)
+    # num_samples = jax.device_count()
+    # prompts = num_samples * [prompt]
+    prompt_ids = pipeline.prepare_inputs(prompts)
 
     # shard inputs and rng
-    params = replicate(params)
+    p_params = replicate(params)
     prng_seed = jax.random.split(prng_seed, jax.device_count())
     # prng_seed = jax.random.split(prng_seed, num_samples)
-    prompt_ids = shard(prompt_ids)
+    p_prompt_ids = shard(prompt_ids)
 
     SHOW_DIR = "_data/output/show"
     os.makedirs(SHOW_DIR, exist_ok=True)
-    for i in range(8):
+    images = pipeline(
+        p_prompt_ids, p_params, prng_seed, num_inference_steps, jit=True
+    ).images
+    images = pipeline.numpy_to_pil(
+        np.asarray(images.reshape((len(prompts),) + images.shape[-3:]))
+    )
+    for i, img in enumerate(images):
         print(f"Generating {i}... ", end="")
-        images = pipeline(
-            prompt_ids, params, prng_seed, num_inference_steps, jit=True
-        ).images
-        images = pipeline.numpy_to_pil(
-            np.asarray(images.reshape((num_samples,) + images.shape[-3:]))
-        )
-        img = images[0]
         img_path = os.path.join(SHOW_DIR, f"{i}.jpg")
         print(f"Saving to {img_path}")
         img.save(img_path)
-        # TODO: figure out how to pass multiple PRNG in one hop
-        prng_seed = jax.random.split(prng_seed[0], 1)
+
+# def generate(pipeline, params, prompt, prng_seed=None):
+#     pipeline.safety_checker = None
+#     if prng_seed is None:
+#         prng_seed = jax.random.PRNGKey(1)
+#     num_inference_steps = 50
+
+#     num_samples = jax.device_count()
+#     prompt = num_samples * [prompt]
+#     prompt_ids = pipeline.prepare_inputs(prompt)
+
+#     # shard inputs and rng
+#     params = replicate(params)
+#     prng_seed = jax.random.split(prng_seed, jax.device_count())
+#     # prng_seed = jax.random.split(prng_seed, num_samples)
+#     prompt_ids = shard(prompt_ids)
+
+#     SHOW_DIR = "_data/output/show"
+#     os.makedirs(SHOW_DIR, exist_ok=True)
+#     for i in range(8):
+#         print(f"Generating {i}... ", end="")
+#         images = pipeline(
+#             prompt_ids, params, prng_seed, num_inference_steps, jit=True
+#         ).images
+#         images = pipeline.numpy_to_pil(
+#             np.asarray(images.reshape((num_samples,) + images.shape[-3:]))
+#         )
+#         img = images[0]
+#         img_path = os.path.join(SHOW_DIR, f"{i}.jpg")
+#         print(f"Saving to {img_path}")
+#         img.save(img_path)
+#         # TODO: figure out how to pass multiple PRNG in one hop
+#         prng_seed = jax.random.split(prng_seed[0], 1)
 
 
 class FlaxStableDiffusion:
