@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import transformers
-from flax.jax_utils import replicate
+from flax.jax_utils import replicate, unreplicate
 from flax import linen as nn
 from diffusers import (
     FlaxAutoencoderKL,
@@ -48,6 +48,7 @@ from gendo.data import DreamBoothDataset, PromptDataset, collate_with_tokenizer
 TEXT_ENC = "text_encoder"
 VAE = "vae"
 UNET = "unet"
+NOISE_SCHEDULER = "noise_scheduler"
 
 
 # Cache compiled models across invocations of this script.
@@ -56,8 +57,8 @@ cc.initialize_cache(os.path.expanduser("~/.cache/jax/compilation_cache"))
 logger = logging.getLogger(__name__)
 
 
-def get_params_to_save(params):
-    return jax.device_get(jax.tree_util.tree_map(lambda x: x[0], params))
+# def get_params_to_save(params):
+#     return jax.device_get(jax.tree_util.tree_map(lambda x: x[0], params))
 
 
 def create_dataloader(
@@ -78,17 +79,7 @@ def create_dataloader(
     return train_dataloader
 
 
-def pipeline_and_params(
-    unet,
-    unet_params,
-    text_encoder,
-    text_encoder_params,
-    vae,
-    vae_params,
-    noise_scheduler,  # not used?
-    noise_scheduler_state,  # not used?
-    tokenizer,
-):
+def pipeline_and_params(models: dict, state: "TrainState", tokenizer):
     # Create the pipeline using the trained modules and save it.
     # surprise, surprise! pipeline._generate doesn't work with the DDPM scheduler,
     # so we have to use another one here
@@ -101,9 +92,9 @@ def pipeline_and_params(
         "CompVis/stable-diffusion-safety-checker", from_pt=True
     )
     pipeline = FlaxStableDiffusionPipeline(
-        text_encoder=text_encoder,
-        vae=vae,
-        unet=unet,
+        text_encoder=models[TEXT_ENC],
+        vae=models[VAE],
+        unet=models[UNET],
         tokenizer=tokenizer,
         scheduler=noise_scheduler,
         safety_checker=safety_checker,
@@ -111,10 +102,15 @@ def pipeline_and_params(
             "openai/clip-vit-base-patch32"
         ),
     )
+    def get_params_or_static(state: TrainState, name: str):
+        if name in state.params:
+            return state.params[name]
+        else:
+            return state.static[name]
     params = {
-        "text_encoder": get_params_to_save(text_encoder_params),
-        "vae": get_params_to_save(vae_params),
-        "unet": get_params_to_save(unet_params),
+        "text_encoder": get_params_or_static(state, TEXT_ENC),
+        "vae": get_params_or_static(state, VAE),
+        "unet": get_params_or_static(state, UNET),
         "scheduler": noise_scheduler_state,
         "safety_checker": safety_checker.params,
     }
@@ -265,6 +261,7 @@ def train(
     model_id: str,
     instance_data_dir: str,
     instance_prompt: str,
+    trainables: Sequence[str] = ("unet",),
     revision: Optional[str] = "flax",
     seed: int = 1,
     batch_size: int = 1,
@@ -276,7 +273,6 @@ def train(
     tokenizer = CLIPTokenizer.from_pretrained(
         model_id, subfolder="tokenizer", revision=revision
     )
-    rng = jax.random.PRNGKey(seed)
     train_dataloader = create_dataloader(
         instance_data_dir, instance_prompt, tokenizer, batch_size=batch_size
     )
@@ -314,24 +310,22 @@ def train(
             VAE: vae_params,
         },
         noise_scheduler_state,
+        trainables=trainables,
         learning_rate=learning_rate,
     )
     models = {
-        "text_encoder": text_encoder,
-        "vae": vae,
-        "unet": unet,
-        "noise_scheduler": noise_scheduler,
+        TEXT_ENC: text_encoder,
+        VAE: vae,
+        UNET: unet,
+        NOISE_SCHEDULER: noise_scheduler,
     }
 
-
-
-    batch = next(iter(train_dataloader))
-
     p_state = jax_utils.replicate(state)
-    p_batch = shard(batch)
     p_train_step = jax.pmap(partial(train_step, models), "batch", static_broadcasted_argnums=2)
-    p_train_step(p_state, p_batch, ("unet",))
 
+    # batch = next(iter(train_dataloader))
+    # p_batch = shard(batch)
+    # p_train_step(p_state, p_batch, trainables)
 
     # global_step = 0
 
@@ -347,7 +341,7 @@ def train(
         # train
         for batch in train_dataloader:
             batch = shard(batch)
-            p_state, metrics = p_train_step(p_state, p_batch, ("unet",))
+            p_state, metrics = p_train_step(p_state, batch, trainables)
             train_metrics.append(metrics)
             train_step_progress_bar.update(jax.local_device_count())
             # global_step += 1
@@ -358,18 +352,7 @@ def train(
         )
     # if jax.process_index() == 0:
     #     checkpoint(unet, unet_state.params, text_encoder, text_encoder_state.params, vae, vae_params, tokenizer, output_dir)
-    # return pipeline_and_params(
-    #     unet,
-    #     unet_state.params,
-    #     text_encoder,
-    #     text_encoder_state.params,
-    #     vae,
-    #     vae_params,
-    #     noise_scheduler,
-    #     noise_scheduler_state,
-    #     tokenizer,
-    # )
-    return state
+    return pipeline_and_params(models, unreplicate(p_state), tokenizer)
 
 
 def generate(pipeline, params, prompt, prng_seed=None):
@@ -435,23 +418,23 @@ def main():
     instance_data_dir = "_data/input/gulnara"
     instance_prompt = "a photo of a beautiful woman"
     output_dir = "_data/models/gulnara"
+    trainables = ("unet",)
     revision = "flax"
     seed = 1
     batch_size = 1
     learning_rate: float = 5e-6
-    train_text_encoder = True
     num_train_epochs = 50
     model = FlaxStableDiffusion.fit(
         model_id,
         instance_data_dir,
         instance_prompt,
+        trainables=trainables,
         revision=revision,
         seed=seed,
         batch_size=batch_size,
         learning_rate=learning_rate,
-        train_text_encoder=train_text_encoder,
         num_train_epochs=num_train_epochs,
     )
     model.save(output_dir)
     model = FlaxStableDiffusion.load(output_dir)
-    model.predict("a beautiful man with drums on a moon")
+    model.predict("a photo of a beautiful woman")
