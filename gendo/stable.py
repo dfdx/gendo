@@ -425,17 +425,22 @@ def example():
     )
     model.save(output_dir)
 
-    SHOW_DIR = "_data/output/show"
-    os.makedirs(SHOW_DIR, exist_ok=True)
+    def gen(model, prompt):
+        SHOW_DIR = "_data/output/show"
+        os.makedirs(SHOW_DIR, exist_ok=True)
+        images = model.predict(
+            [prompt] * 8,
+            num_inference_steps=50,
+            guidance_scale=7.5,
+        )
+        for i, img in enumerate(images):
+            print(f"Generating {i}... ", end="")
+            img_path = os.path.join(SHOW_DIR, f"{i}.jpg")
+            print(f"Saving to {img_path}")
+            img.save(img_path)
+
     model = FlaxStableDiffusion.load(output_dir)
-    prompt = "jane doe on a soviet postcard, christmas, 1961"
-    images = model.predict(
-        [prompt] * 8,
-        num_inference_steps=50,
-        guidance_scale=7.5,
-    )
-    for i, img in enumerate(images):
-        print(f"Generating {i}... ", end="")
-        img_path = os.path.join(SHOW_DIR, f"{i}.jpg")
-        print(f"Saving to {img_path}")
-        img.save(img_path)
+    prompt = "a child playing in a room"
+    gen(model, prompt)
+
+
