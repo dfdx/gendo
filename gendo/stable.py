@@ -1,10 +1,7 @@
-import argparse
-import hashlib
 import logging
-import math
 import os
 from pathlib import Path
-from typing import Optional, Any, Sequence
+from typing import Optional, Any, Sequence, Dict
 from functools import partial
 
 import numpy as np
@@ -15,9 +12,7 @@ from torch.utils.data import Dataset
 import jax
 import jax.numpy as jnp
 import optax
-import transformers
 from flax.jax_utils import replicate, unreplicate
-from flax import linen as nn
 from diffusers import (
     FlaxAutoencoderKL,
     FlaxDDPMScheduler,
@@ -26,14 +21,10 @@ from diffusers import (
     FlaxUNet2DConditionModel,
 )
 from diffusers.pipelines.stable_diffusion import FlaxStableDiffusionSafetyChecker
-from diffusers.utils import check_min_version
 from flax import jax_utils
 from flax.training import train_state
 from flax.training.common_utils import shard
-from huggingface_hub import HfFolder, Repository, create_repo, whoami
 from jax.experimental.compilation_cache import compilation_cache as cc
-from PIL import Image
-from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import (
     CLIPFeatureExtractor,
@@ -42,7 +33,7 @@ from transformers import (
     set_seed,
 )
 
-from gendo.data import DreamBoothDataset, PromptDataset, collate_with_tokenizer
+from gendo.data import DreamBoothDataset, collate_with_tokenizer
 
 # just to avoid mistyping
 TEXT_ENC = "text_encoder"
@@ -55,10 +46,6 @@ NOISE_SCHEDULER = "noise_scheduler"
 cc.initialize_cache(os.path.expanduser("~/.cache/jax/compilation_cache"))
 
 logger = logging.getLogger(__name__)
-
-
-# def get_params_to_save(params):
-#     return jax.device_get(jax.tree_util.tree_map(lambda x: x[0], params))
 
 
 def create_dataloader(
@@ -102,11 +89,13 @@ def pipeline_and_params(models: dict, state: "TrainState", tokenizer):
             "openai/clip-vit-base-patch32"
         ),
     )
+
     def get_params_or_static(state: TrainState, name: str):
         if name in state.params:
             return state.params[name]
         else:
             return state.static[name]
+
     params = {
         "text_encoder": get_params_or_static(state, TEXT_ENC),
         "vae": get_params_or_static(state, VAE),
@@ -115,8 +104,6 @@ def pipeline_and_params(models: dict, state: "TrainState", tokenizer):
         "safety_checker": safety_checker.params,
     }
     return pipeline, params
-
-
 
 
 class TrainState(train_state.TrainState):
@@ -130,7 +117,7 @@ def create_train_state(
     noise_scheduler_state,
     learning_rate: float = 5e-6,
     rng_seed: int = 0,
-    trainables: Sequence[str] = ("unet",)
+    trainables: Sequence[str] = ("unet",),
 ):
     # split components into trainable params and static arrays
     non_trainables = list(set(components.keys()) - set(trainables))
@@ -156,7 +143,7 @@ def create_train_state(
         static=static,
         tx=optimizer,
         noise_scheduler_state=noise_scheduler_state,
-        rng=jax.random.PRNGKey(rng_seed)
+        rng=jax.random.PRNGKey(rng_seed),
     )
 
 
@@ -167,7 +154,9 @@ def get_params(name: str, static: dict, params: dict, trainables: Sequence[str])
         return static[name]
 
 
-def train_step(models: dict, state: TrainState, batch, trainables: Sequence[str] = ("unet",)):
+def train_step(
+    models: dict, state: TrainState, batch, trainables: Sequence[str] = ("unet",)
+):
     dropout_rng, sample_rng, new_rng = jax.random.split(state.rng, 3)
     text_encoder, vae, unet, noise_scheduler = (
         models["text_encoder"],
@@ -177,7 +166,9 @@ def train_step(models: dict, state: TrainState, batch, trainables: Sequence[str]
     )
 
     def loss_fn(params):
-        text_encoder_params = get_params("text_encoder", state.static, params, trainables)
+        text_encoder_params = get_params(
+            "text_encoder", state.static, params, trainables
+        )
         vae_params = get_params("vae", state.static, params, trainables)
         unet_params = get_params("unet", state.static, params, trainables)
         # Convert images to latent space
@@ -237,7 +228,6 @@ def train_step(models: dict, state: TrainState, batch, trainables: Sequence[str]
             raise ValueError(
                 f"Unknown prediction type {noise_scheduler.config.prediction_type}"
             )
-
         loss = (target - model_pred) ** 2
         loss = loss.mean()
         return loss
@@ -249,9 +239,6 @@ def train_step(models: dict, state: TrainState, batch, trainables: Sequence[str]
     metrics = {"loss": loss}
     metrics = jax.lax.pmean(metrics, axis_name="batch")
 
-    # print(f"type(grads) == {type(grads)}")
-    # print(f"grads[0].keys() == {grads[0].keys()}")
-    # print(f"grads[1].keys() == {grads[1].keys()}")
     state = state.apply_gradients(grads=grads)
     state = state.replace(rng=new_rng)
     return state, metrics
@@ -300,9 +287,6 @@ def train(
     )
     noise_scheduler_state = noise_scheduler.create_state()
 
-    # Initialize our training
-    # train_rngs = jax.random.split(rng, jax.local_device_count())
-
     state = create_train_state(
         {
             UNET: unet_params,
@@ -321,11 +305,9 @@ def train(
     }
 
     p_state = jax_utils.replicate(state)
-    p_train_step = jax.pmap(partial(train_step, models), "batch", static_broadcasted_argnums=2)
-
-    # batch = next(iter(train_dataloader))
-    # p_batch = shard(batch)
-    # p_train_step(p_state, p_batch, trainables)
+    p_train_step = jax.pmap(
+        partial(train_step, models), "batch", static_broadcasted_argnums=2
+    )
 
     # global_step = 0
 
@@ -350,16 +332,21 @@ def train(
         epochs.write(
             f"Epoch... ({epoch + 1}/{num_train_epochs} | Loss: {train_metrics[-1]['loss']})"
         )
-    # if jax.process_index() == 0:
-    #     checkpoint(unet, unet_state.params, text_encoder, text_encoder_state.params, vae, vae_params, tokenizer, output_dir)
     return pipeline_and_params(models, unreplicate(p_state), tokenizer)
 
 
-def generate(pipeline: FlaxStableDiffusionPipeline, params, prompts: list[str], prng_seed=None):
+def generate(
+    pipeline: FlaxStableDiffusionPipeline,
+    params,
+    prompts: list[str],
+    prng_seed=None,
+    num_inference_steps=50,
+    guidance_scale: float = 7.5,
+    **kwargs,
+):
     pipeline.safety_checker = None
     if prng_seed is None:
         prng_seed = jax.random.PRNGKey(1)
-    num_inference_steps = 50
 
     # num_samples = jax.device_count()
     # prompts = num_samples * [prompt]
@@ -371,61 +358,30 @@ def generate(pipeline: FlaxStableDiffusionPipeline, params, prompts: list[str], 
     # prng_seed = jax.random.split(prng_seed, num_samples)
     p_prompt_ids = shard(prompt_ids)
 
-    SHOW_DIR = "_data/output/show"
-    os.makedirs(SHOW_DIR, exist_ok=True)
     images = pipeline(
-        p_prompt_ids, p_params, prng_seed, num_inference_steps, jit=True
+        p_prompt_ids,
+        p_params,
+        prng_seed,
+        num_inference_steps,
+        guidance_scale=float(guidance_scale),
+        jit=True,
+        **kwargs,
     ).images
     images = pipeline.numpy_to_pil(
         np.asarray(images.reshape((len(prompts),) + images.shape[-3:]))
     )
-    for i, img in enumerate(images):
-        print(f"Generating {i}... ", end="")
-        img_path = os.path.join(SHOW_DIR, f"{i}.jpg")
-        print(f"Saving to {img_path}")
-        img.save(img_path)
-
-# def generate(pipeline, params, prompt, prng_seed=None):
-#     pipeline.safety_checker = None
-#     if prng_seed is None:
-#         prng_seed = jax.random.PRNGKey(1)
-#     num_inference_steps = 50
-
-#     num_samples = jax.device_count()
-#     prompt = num_samples * [prompt]
-#     prompt_ids = pipeline.prepare_inputs(prompt)
-
-#     # shard inputs and rng
-#     params = replicate(params)
-#     prng_seed = jax.random.split(prng_seed, jax.device_count())
-#     # prng_seed = jax.random.split(prng_seed, num_samples)
-#     prompt_ids = shard(prompt_ids)
-
-#     SHOW_DIR = "_data/output/show"
-#     os.makedirs(SHOW_DIR, exist_ok=True)
-#     for i in range(8):
-#         print(f"Generating {i}... ", end="")
-#         images = pipeline(
-#             prompt_ids, params, prng_seed, num_inference_steps, jit=True
-#         ).images
-#         images = pipeline.numpy_to_pil(
-#             np.asarray(images.reshape((num_samples,) + images.shape[-3:]))
-#         )
-#         img = images[0]
-#         img_path = os.path.join(SHOW_DIR, f"{i}.jpg")
-#         print(f"Saving to {img_path}")
-#         img.save(img_path)
-#         # TODO: figure out how to pass multiple PRNG in one hop
-#         prng_seed = jax.random.split(prng_seed[0], 1)
+    return images
 
 
 class FlaxStableDiffusion:
-    def __init__(self, pipeline, params):
+    def __init__(self, pipeline: FlaxStableDiffusionPipeline, params: Dict):
         self.pipeline = pipeline
         self.params = params
 
-    def predict(self, prompt, prng_seed=None):
-        return generate(self.pipeline, self.params, prompt, prng_seed)
+    def predict(self, prompt, prng_seed=None, **kwargs):
+        if isinstance(prompt, str):
+            prompt = [prompt]
+        return generate(self.pipeline, self.params, prompt, prng_seed, **kwargs)
 
     @staticmethod
     def fit(*args, **kwargs):
@@ -438,17 +394,19 @@ class FlaxStableDiffusion:
     @classmethod
     def load(cls, path):
         pipeline, params = FlaxStableDiffusionPipeline.from_pretrained(
-            path, revision="flax", dtype=jax.numpy.bfloat16
+            path, revision="bf16", dtype=jax.numpy.bfloat16
         )
         return FlaxStableDiffusion(pipeline, params)
 
 
-def main():
+def example():
+    # model_id = "stabilityai/stable-diffusion-2-1"
     model_id = "runwayml/stable-diffusion-v1-5"
-    instance_data_dir = "_data/input/gulnara"
-    instance_prompt = "a photo of a beautiful woman"
-    output_dir = "_data/models/gulnara"
-    trainables = ("unet",)
+    instance_data_dir = "_data/input/subj2/processed"
+    instance_prompt = "a photo of jane doe"
+    output_dir = "_data/models/subj"
+    trainables = ("unet", "text_encoder")
+    # revision = "bf16"
     revision = "flax"
     seed = 1
     batch_size = 1
@@ -466,5 +424,18 @@ def main():
         num_train_epochs=num_train_epochs,
     )
     model.save(output_dir)
+
+    SHOW_DIR = "_data/output/show"
+    os.makedirs(SHOW_DIR, exist_ok=True)
     model = FlaxStableDiffusion.load(output_dir)
-    model.predict("a photo of a beautiful woman")
+    prompt = "jane doe on a soviet postcard, christmas, 1961"
+    images = model.predict(
+        [prompt] * 8,
+        num_inference_steps=50,
+        guidance_scale=7.5,
+    )
+    for i, img in enumerate(images):
+        print(f"Generating {i}... ", end="")
+        img_path = os.path.join(SHOW_DIR, f"{i}.jpg")
+        print(f"Saving to {img_path}")
+        img.save(img_path)
