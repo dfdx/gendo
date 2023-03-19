@@ -12,6 +12,7 @@ from torch.utils.data import Dataset
 import jax
 import jax.numpy as jnp
 import optax
+from flax.core import frozen_dict
 from flax.jax_utils import replicate, unreplicate
 from diffusers import (
     FlaxAutoencoderKL,
@@ -90,40 +91,57 @@ def pipeline_and_params(models: dict, state: "TrainState", tokenizer):
         ),
     )
 
-    def get_params_or_static(state: TrainState, name: str):
-        if name in state.params:
-            return state.params[name]
-        else:
-            return state.static[name]
-
     params = {
-        "text_encoder": get_params_or_static(state, TEXT_ENC),
-        "vae": get_params_or_static(state, VAE),
-        "unet": get_params_or_static(state, UNET),
+        "text_encoder": state.params[TEXT_ENC],
+        "vae": state.params[VAE],
+        "unet": state.params[UNET],
         "scheduler": noise_scheduler_state,
         "safety_checker": safety_checker.params,
     }
     return pipeline, params
 
 
+def create_mask(params: dict, label_fn, recursive=False):
+    """
+    Create a mask for frozen parameters.
+    See for details: https://github.com/google/flax/discussions/1706
+    """
+    def _map(params, mask, label_fn):
+        for k in params:
+            if label_fn(k):
+                mask[k] = 'zero'
+            else:
+                if recursive and isinstance(params[k], frozen_dict.FrozenDict):
+                    mask[k] = {}
+                    _map(params[k], mask[k], label_fn)
+                else:
+                    mask[k] = 'adam'
+    mask = {}
+    _map(params, mask, label_fn)
+    return frozen_dict.freeze(mask)
+
+
+def zero_grads():
+    # from https://github.com/deepmind/optax/issues/159#issuecomment-896459491
+    def init_fn(_):
+        return ()
+    def update_fn(updates, state, params=None):
+        return jax.tree_map(jnp.zeros_like, updates), ()
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
 class TrainState(train_state.TrainState):
-    static: dict[str, Any]
     noise_scheduler_state: Any
     rng: Any
 
 
 def create_train_state(
-    components: dict,
+    params: dict,
     noise_scheduler_state,
     learning_rate: float = 5e-6,
     rng_seed: int = 0,
     trainables: Sequence[str] = ("unet",),
 ):
-    # split components into trainable params and static arrays
-    non_trainables = list(set(components.keys()) - set(trainables))
-    params = {k: v for k, v in components.items() if k in trainables}
-    static = {k: v for k, v in components.items() if k in non_trainables}
-
     # Optimization
     constant_scheduler = optax.constant_schedule(learning_rate)
     adamw = optax.adamw(
@@ -133,25 +151,28 @@ def create_train_state(
         eps=1e-08,
         weight_decay=1e-2,
     )
-    optimizer = optax.chain(
+    masked = optax.multi_transform(
+        {'adam': adamw, 'zero': zero_grads()},
+        create_mask(params, lambda k: k not in trainables)
+    )
+    tx = optax.chain(
         optax.clip_by_global_norm(1.0),
-        adamw,
+        masked,
     )
     return TrainState.create(
         apply_fn=None,
-        params=params,
-        static=static,
-        tx=optimizer,
+        params=frozen_dict.freeze(params),
+        tx=tx,
         noise_scheduler_state=noise_scheduler_state,
         rng=jax.random.PRNGKey(rng_seed),
     )
 
 
-def get_params(name: str, static: dict, params: dict, trainables: Sequence[str]):
-    if name in trainables:
-        return params[name]
-    else:
-        return static[name]
+# def get_params(name: str, static: dict, params: dict, trainables: Sequence[str]):
+#     if name in trainables:
+#         return params[name]
+#     else:
+#         return static[name]
 
 
 def train_step(
@@ -166,14 +187,14 @@ def train_step(
     )
 
     def loss_fn(params):
-        text_encoder_params = get_params(
-            "text_encoder", state.static, params, trainables
-        )
-        vae_params = get_params("vae", state.static, params, trainables)
-        unet_params = get_params("unet", state.static, params, trainables)
+        # text_encoder_params = get_params(
+        #     "text_encoder", state.static, params, trainables
+        # )
+        # vae_params = get_params("vae", state.static, params, trainables)
+        # unet_params = get_params("unet", state.static, params, trainables)
         # Convert images to latent space
         vae_outputs = vae.apply(
-            {"params": vae_params},
+            {"params": params[VAE]},
             batch["pixel_values"],
             deterministic=True,
             method=vae.encode,
@@ -203,14 +224,14 @@ def train_step(
 
         encoder_hidden_states = text_encoder(
             batch["input_ids"],
-            params=text_encoder_params,
+            params=params[TEXT_ENC],
             dropout_rng=dropout_rng,
             train=True,  # TODO: or not
         )[0]
 
         # Predict the noise residual
         model_pred = unet.apply(
-            {"params": unet_params},
+            {"params": params[UNET]},
             noisy_latents,
             timesteps,
             encoder_hidden_states,
@@ -440,7 +461,7 @@ def example():
             img.save(img_path)
 
     model = FlaxStableDiffusion.load(output_dir)
-    prompt = "a child playing in a room"
+    prompt = "a photo of jane doe"
     gen(model, prompt)
 
 
