@@ -44,7 +44,26 @@ def generate_response(instruction: str, *, model: PreTrainedModel, tokenizer: Pr
 
 
 def main():
+    # from transformers import FlaxAutoModelForCausalLM
+    # from transformers.models.gptj.modeling_flax_gptj import FlaxGPTJForCausalLMModule
+    # FlaxAutoModelForCausalLM.from_pretrained("databricks/dolly-v1-6b", device_map="auto", trust_remote_code=True)
+    # FlaxGPTJForCausalLMModule()
+
     tokenizer = AutoTokenizer.from_pretrained("databricks/dolly-v1-6b", padding_side="left")
     model = AutoModelForCausalLM.from_pretrained("databricks/dolly-v1-6b", device_map="auto", trust_remote_code=True)
     # Sample similar to: "Excited to announce the release of Dolly, a powerful new language model from Databricks! #AI #Databricks"
-    generate_response("I don't give a fuck if niger dies or not\n\nDoes this text expose hate?", model=model, tokenizer=tokenizer)
+
+    text = """
+    Katty has always wanted to be a programmer. Thus, for Christmas she asked her parents to buy her a personal computer so she could write programs in Python.
+    But her parents had other plans. Her dad, who was a lowyer, wanted Katty to go to the college and get a degree in biology.
+    On Christam eve, Katty realized her dream won't come true if she stays home. And so she leaves.
+    Early in the morning, Katty wrote a letter to her parents: "Dear mom and dad, thank you for all the cookies, but today I'm leaving to make my dream come true".
+
+    Then she took her bag and quickly ran to the nearest town.
+
+    But before she even left her own town, she noticed a railway. "Why haven't I seen it before?" - she asked herself. - "But it is convenient - I'll go by train".
+
+    And so Katty jumped into the nearest train car.
+    """
+    out = generate_response(f"summarize in less than 100 words: {text}", model=model, tokenizer=tokenizer)
+    print(out)
