@@ -4,7 +4,8 @@ RUN apt-get update
 RUN apt-get -y install python3 python3-pip git
 
 RUN pip install wheel
-RUN pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cu113
+RUN pip install torch==2.0.0+cu117 torchvision --extra-index-url https://download.pytorch.org/whl/cu113
+RUN pip install accelerate
 RUN pip install transformers
 RUN pip install datasets
 # RUN pip install diffusers[training]

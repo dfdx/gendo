@@ -426,8 +426,9 @@ class FlaxStableDiffusion:
 def example():
     # model_id = "stabilityai/stable-diffusion-2-1"
     model_id = "runwayml/stable-diffusion-v1-5"
-    instance_data_dir = "_data/input/subj2/processed"
-    instance_prompt = "a photo of jane doe"
+    # instance_data_dir = "_data/input/subj2/processed"
+    instance_data_dir = "_data/input/subj3"
+    instance_prompt = "john doe"
     output_dir = "_data/models/subj"
     trainables = ("unet", "text_encoder")
     # revision = "bf16"
@@ -464,5 +465,5 @@ def example():
             img.save(img_path)
 
     model = FlaxStableDiffusion.load(output_dir)
-    prompt = "a photo of jane doe"
+    prompt = "john doe holding a baseball bat, GTA V vice city style"
     gen(model, prompt)
