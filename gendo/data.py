@@ -1,13 +1,13 @@
 import os
 import random
-import PIL
-from PIL import Image
 from pathlib import Path
 
-import numpy as np
 import jax
 import jax.numpy as jnp
+import numpy as np
+import PIL
 import torch
+from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 

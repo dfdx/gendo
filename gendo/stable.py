@@ -1,19 +1,15 @@
 import logging
 import os
-from pathlib import Path
-from typing import Optional, Any, Sequence, Dict
 from functools import partial
-
-import numpy as np
-import torch
-import torch.utils.checkpoint
-from torch.utils.data import Dataset
+from pathlib import Path
+from typing import Any, Dict, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
-from flax.core import frozen_dict
-from flax.jax_utils import replicate, unreplicate
+import torch
+import torch.utils.checkpoint
 from diffusers import (
     FlaxAutoencoderKL,
     FlaxDDPMScheduler,
@@ -23,9 +19,12 @@ from diffusers import (
 )
 from diffusers.pipelines.stable_diffusion import FlaxStableDiffusionSafetyChecker
 from flax import jax_utils
+from flax.core import frozen_dict
+from flax.jax_utils import replicate, unreplicate
 from flax.training import train_state
 from flax.training.common_utils import shard
 from jax.experimental.compilation_cache import compilation_cache as cc
+from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 from transformers import (
     CLIPFeatureExtractor,
@@ -106,16 +105,18 @@ def create_mask(params: dict, label_fn, recursive=False):
     Create a mask for frozen parameters.
     See for details: https://github.com/google/flax/discussions/1706
     """
+
     def _map(params, mask, label_fn):
         for k in params:
             if label_fn(k):
-                mask[k] = 'zero'
+                mask[k] = "zero"
             else:
                 if recursive and isinstance(params[k], frozen_dict.FrozenDict):
                     mask[k] = {}
                     _map(params[k], mask[k], label_fn)
                 else:
-                    mask[k] = 'adam'
+                    mask[k] = "adam"
+
     mask = {}
     _map(params, mask, label_fn)
     return frozen_dict.freeze(mask)
@@ -125,8 +126,10 @@ def zero_grads():
     # from https://github.com/deepmind/optax/issues/159#issuecomment-896459491
     def init_fn(_):
         return ()
+
     def update_fn(updates, state, params=None):
         return jax.tree_map(jnp.zeros_like, updates), ()
+
     return optax.GradientTransformation(init_fn, update_fn)
 
 
@@ -152,8 +155,8 @@ def create_train_state(
         weight_decay=1e-2,
     )
     masked = optax.multi_transform(
-        {'adam': adamw, 'zero': zero_grads()},
-        create_mask(params, lambda k: k not in trainables)
+        {"adam": adamw, "zero": zero_grads()},
+        create_mask(params, lambda k: k not in trainables),
     )
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
@@ -423,8 +426,9 @@ class FlaxStableDiffusion:
 def example():
     # model_id = "stabilityai/stable-diffusion-2-1"
     model_id = "runwayml/stable-diffusion-v1-5"
-    instance_data_dir = "_data/input/subj2/processed"
-    instance_prompt = "a photo of jane doe"
+    # instance_data_dir = "_data/input/subj2/processed"
+    instance_data_dir = "_data/input/subj3"
+    instance_prompt = "john doe"
     output_dir = "_data/models/subj"
     trainables = ("unet", "text_encoder")
     # revision = "bf16"
@@ -461,7 +465,5 @@ def example():
             img.save(img_path)
 
     model = FlaxStableDiffusion.load(output_dir)
-    prompt = "a photo of jane doe"
+    prompt = "john doe holding a baseball bat, GTA V vice city style"
     gen(model, prompt)
-
-
