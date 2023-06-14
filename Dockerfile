@@ -13,6 +13,7 @@ RUN pip install git+https://github.com/huggingface/diffusers
 RUN pip install --upgrade "jax[cuda]" jaxlib -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 RUN pip install flax optax
 RUN pip install ftfy tensorboard Jinja2
+RUN pip install einops
 
 RUN pip install ipython
 
