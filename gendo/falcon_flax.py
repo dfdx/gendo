@@ -444,8 +444,8 @@ class RWModule(nn.Module):
 
         self.gradient_checkpointing = False
 
-        # Initialize weights and apply final processing
-        self.post_init()
+        ## Initialize weights and apply final processing
+        # self.post_init()
 
     def get_input_embeddings(self):
         return self.word_embeddings
@@ -517,33 +517,31 @@ class RWModule(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
 
-        # hidden_states = inputs_embeds
+        hidden_states = inputs_embeds
 
-        # presents = () if use_cache else None
-        # all_self_attentions = () if output_attentions else None
-        # all_hidden_states = () if output_hidden_states else None
+        presents = () if use_cache else None
+        all_self_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
 
-        # # Compute alibi tensor: check build_alibi_tensor documentation
-        # seq_length_with_past = seq_length
-        # past_key_values_length = 0
-        # if past_key_values[0] is not None:
-        #     past_key_values_length = past_key_values[0][0].shape[2]
-        #     seq_length_with_past = seq_length_with_past + past_key_values_length
-        # if attention_mask is None:
-        #     attention_mask = torch.ones((batch_size, seq_length_with_past), device=hidden_states.device)
-        # else:
-        #     attention_mask = attention_mask.to(hidden_states.device)
+        # Compute alibi tensor: check build_alibi_tensor documentation
+        seq_length_with_past = seq_length
+        past_key_values_length = 0
+        if past_key_values[0] is not None:
+            past_key_values_length = past_key_values[0][0].shape[2]
+            seq_length_with_past = seq_length_with_past + past_key_values_length
+        if attention_mask is None:
+            attention_mask = jnp.ones((batch_size, seq_length_with_past))
 
-        # if self.alibi:
-        #     alibi = build_alibi_tensor(attention_mask, self.num_heads, dtype=hidden_states.dtype)
-        # else:
-        #     alibi = None
+        if self.alibi:
+            alibi = build_alibi_tensor(attention_mask, self.num_heads)
+        else:
+            alibi = None
 
-        # causal_mask = self._prepare_attn_mask(
-        #     attention_mask,
-        #     input_shape=(batch_size, seq_length),
-        #     past_key_values_length=past_key_values_length,
-        # )
+        causal_mask = self._prepare_attn_mask(
+            attention_mask,
+            input_shape=(batch_size, seq_length),
+            past_key_values_length=past_key_values_length,
+        )
 
         # for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
 
@@ -572,7 +570,39 @@ class RWModule(nn.Module):
         #             causal_mask,
         #             head_mask[i],
         #         )
-        #
+        #     else:
+        #         outputs = block(
+        #             hidden_states,
+        #             layer_past=layer_past,
+        #             attention_mask=causal_mask,
+        #             head_mask=head_mask[i],
+        #             use_cache=use_cache,
+        #             output_attentions=output_attentions,
+        #             alibi=alibi,
+        #         )
+
+        #     hidden_states = outputs[0]
+        #     if use_cache is True:
+        #         presents = presents + (outputs[1],)
+
+        #     if output_attentions:
+        #         all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
+
+        # # Add last hidden state
+        # hidden_states = self.ln_f(hidden_states)
+
+        # if output_hidden_states:
+        #     all_hidden_states = all_hidden_states + (hidden_states,)
+
+        # if not return_dict:
+        #     return tuple(v for v in [hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None)
+
+        # return BaseModelOutputWithPastAndCrossAttentions(
+        #     last_hidden_state=hidden_states,
+        #     past_key_values=presents,
+        #     hidden_states=all_hidden_states,
+        #     attentions=all_self_attentions,
+        # )
 
 
 def main():
@@ -603,9 +633,6 @@ def main():
     output_attentions = False
     decoder_out = self.apply(variables, hidden_states, alibi, attention_mask)
 
-    self = RWModel(config)
-    variables = self.init(rng, hidden_states=hidden_states, alibi=alibi, attention_mask=attention_mask)
-    self = self.bind(variables)
     tokenizer = AutoTokenizer.from_pretrained(DEFAULT_MODEL)
     tokenizer.pad_token = tokenizer.eos_token
     input_ids = tokenizer(
@@ -621,6 +648,10 @@ def main():
     output_attentions = None
     output_hidden_states = None
     return_dict = None
+    self = RWModule(config)
+    variables = self.init(rng, input_ids, attention_mask=attention_mask)
+    self = self.bind(variables)
+
 
 
     import transformers
