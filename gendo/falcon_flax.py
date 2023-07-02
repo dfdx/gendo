@@ -1,4 +1,6 @@
-from typing import Optional, Tuple
+import logging
+import warnings
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -8,7 +10,15 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 from einops import rearrange
+from transformers import FlaxPreTrainedModel, AutoTokenizer
+from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 from gendo.configuration_RW import RWConfig
+
+
+logger = logging.getLogger(__name__)
+
+
+DEFAULT_MODEL = "tiiuae/falcon-7b"
 
 
 def not_jax(fn):
@@ -413,6 +423,157 @@ class DecoderLayer(nn.Module):
         return outputs  # hidden_states, present, attentions
 
 
+class RWModule(nn.Module):
+    config: RWConfig
+
+    def setup(self):
+        config = self.config
+
+        self.embed_dim = config.hidden_size
+        self.num_heads = config.n_head
+        self.alibi = config.alibi
+
+        # Embedding + LN Embedding
+        self.word_embeddings = nn.Embed(config.vocab_size, self.embed_dim)
+
+        # Transformer blocks
+        self.h = [DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+
+        # Final Layer Norm
+        self.ln_f = nn.LayerNorm(epsilon=config.layer_norm_epsilon)
+
+        self.gradient_checkpointing = False
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.word_embeddings
+
+    def _prepare_attn_mask(
+        self, attention_mask: jax.Array, input_shape: Tuple[int, int], past_key_values_length: int
+    ): #  -> torch.BoolTensor:
+        # create causal mask
+        # [batch_size, seq_length] -> [batch_size, 1, tgt_length, src_length]
+        combined_attention_mask = None
+        device = attention_mask.device
+        _, src_length = input_shape
+
+        if src_length > 1:
+            combined_attention_mask = _make_causal_mask(
+                input_shape, device=device, past_key_values_length=past_key_values_length
+            )
+
+        # [batch_size, seq_length] -> [batch_size, 1, tgt_length, src_length]
+        expanded_attn_mask = _expand_mask(attention_mask, tgt_length=src_length)
+        combined_attention_mask = (
+            expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask | combined_attention_mask
+        )
+
+        return combined_attention_mask
+
+    def set_input_embeddings(self, new_embeddings: jax.Array):
+        self.word_embeddings = new_embeddings
+
+    def __call__(
+        self,
+        input_ids: Optional[jax.Array] = None,  # long
+        past_key_values: Optional[Tuple[Tuple[jax.Array, jax.Array], ...]] = None,
+        attention_mask: Optional[jax.Array] = None,
+        head_mask: Optional[jax.Array] = None,
+        inputs_embeds: Optional[jax.Array] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple[jax.Array, ...], BaseModelOutputWithPastAndCrossAttentions]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            batch_size, seq_length = input_ids.shape
+        elif inputs_embeds is not None:
+            batch_size, seq_length, _ = inputs_embeds.shape
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        if past_key_values is None:
+            past_key_values = tuple([None] * len(self.h))
+
+        # Prepare head mask if needed
+        # 1.0 in head_mask indicate we keep the head
+        # attention_probs has shape batch_size x num_heads x N x N
+        # head_mask has shape n_layer x batch x num_heads x N x N
+        # TODO: implement case when head_mask is not None
+        # head_mask = self.get_head_mask(head_mask, self.config.n_layer)
+        head_mask = [None] * self.config.n_layer
+
+        if inputs_embeds is None:
+            inputs_embeds = self.word_embeddings(input_ids)
+
+        # hidden_states = inputs_embeds
+
+        # presents = () if use_cache else None
+        # all_self_attentions = () if output_attentions else None
+        # all_hidden_states = () if output_hidden_states else None
+
+        # # Compute alibi tensor: check build_alibi_tensor documentation
+        # seq_length_with_past = seq_length
+        # past_key_values_length = 0
+        # if past_key_values[0] is not None:
+        #     past_key_values_length = past_key_values[0][0].shape[2]
+        #     seq_length_with_past = seq_length_with_past + past_key_values_length
+        # if attention_mask is None:
+        #     attention_mask = torch.ones((batch_size, seq_length_with_past), device=hidden_states.device)
+        # else:
+        #     attention_mask = attention_mask.to(hidden_states.device)
+
+        # if self.alibi:
+        #     alibi = build_alibi_tensor(attention_mask, self.num_heads, dtype=hidden_states.dtype)
+        # else:
+        #     alibi = None
+
+        # causal_mask = self._prepare_attn_mask(
+        #     attention_mask,
+        #     input_shape=(batch_size, seq_length),
+        #     past_key_values_length=past_key_values_length,
+        # )
+
+        # for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
+
+        #     if output_hidden_states:
+        #         all_hidden_states = all_hidden_states + (hidden_states,)
+
+        #     if self.gradient_checkpointing and self.training:
+
+        #         if use_cache:
+        #             logger.warning(
+        #                 "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+        #             )
+        #             use_cache = False
+
+        #         def create_custom_forward(module):
+        #             def custom_forward(*inputs):
+        #                 # None for past_key_value
+        #                 return module(*inputs, use_cache=use_cache, output_attentions=output_attentions)
+
+        #             return custom_forward
+
+        #         outputs = torch.utils.checkpoint.checkpoint(
+        #             create_custom_forward(block),
+        #             hidden_states,
+        #             alibi,
+        #             causal_mask,
+        #             head_mask[i],
+        #         )
+        #
+
 
 def main():
     rng = jax.random.PRNGKey(1932)
@@ -441,3 +602,26 @@ def main():
     head_mask = None
     output_attentions = False
     decoder_out = self.apply(variables, hidden_states, alibi, attention_mask)
+
+    self = RWModel(config)
+    variables = self.init(rng, hidden_states=hidden_states, alibi=alibi, attention_mask=attention_mask)
+    self = self.bind(variables)
+    tokenizer = AutoTokenizer.from_pretrained(DEFAULT_MODEL)
+    tokenizer.pad_token = tokenizer.eos_token
+    input_ids = tokenizer(
+        ["mars needs lovers", "there can be only one!"],
+        return_tensors="np",
+        padding=True,
+        truncation=True,
+    )["input_ids"]
+    past_key_values = None
+    head_mask = None
+    inputs_embeds = None
+    use_cache = None
+    output_attentions = None
+    output_hidden_states = None
+    return_dict = None
+
+
+    import transformers
+    transformers.PreTrainedModel.get_head_mask()
