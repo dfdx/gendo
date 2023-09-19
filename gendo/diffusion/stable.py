@@ -33,7 +33,7 @@ from transformers import (
     set_seed,
 )
 
-from gendo.data import DreamBoothDataset, collate_with_tokenizer
+from gendo.diffusion.data import DreamBoothDataset, collate_with_tokenizer
 
 # just to avoid mistyping
 TEXT_ENC = "text_encoder"
