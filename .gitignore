@@ -146,3 +146,6 @@ _data/
 #.DS_Store files
 *.DS_Store
 app.logs
+
+# special hidden files
+_main.py

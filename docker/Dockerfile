@@ -1,6 +1,11 @@
-FROM nvidia/cuda:11.6.2-runtime-ubuntu18.04 as cuda-base
+# devel version with DNN is required for JIT compilation in some cases
+FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04 AS build-base
+
 
 SHELL ["/bin/bash", "-c"]
+
+RUN apt-get update
+# RUN apt-get -y install python3 python3-pip git
 
 ENV HOME=/root
 ENV PYENV_ROOT="${HOME}/.pyenv"
@@ -16,7 +21,7 @@ RUN mkdir -p $PYENV_ROOT && cd $PYENV_ROOT && tar xvzf /pyenv.tar.gz \
     && source $BASHRC
 
 
-ENV PYTHON_VERSION=3.9.12
+ENV PYTHON_VERSION=3.10.6
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TERM=linux
@@ -62,25 +67,31 @@ RUN pyenv install $PYTHON_VERSION \
     && pyenv global $PYTHON_VERSION \
     && rm -rf /tmp/*
 
-RUN mkdir -p ~/.cache/huggingface
-RUN pip install --no-cache-dir ipython pytest
 
-
-
-FROM cuda-base
 
 RUN pip install wheel
-RUN pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cu113
-RUN pip install transformers
-# RUN pip install diffusers[training]
-RUN pip install git+https://github.com/huggingface/diffusers
-RUN pip install --upgrade "jax[cuda]" jaxlib -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-RUN pip install flax optax
-RUN pip install ftfy tensorboard Jinja2
 
-RUN pip install ipython
+# jax needs to be installed first because otherwise torch dependencies will force older version of jax
+RUN pip install --upgrade "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+RUN pip install flax optax
+
+RUN pip install sentencepiece
+
+# fix torch version because updating it often leads to painful results
+# RUN pip install torch==2.0.0 torchvision lightning
+RUN pip install transformers accelerate datasets
+RUN pip install einops
+
 
 RUN mkdir -p /root/.cache
 
+# ensure libraries see CUDA
 RUN echo 'export LD_LIBRARY_PATH=/usr/local/cuda-11/lib64:/usr/lib/x86_64-linux-gnu/:${LD_LIBRARY_PATH}' >> /root/.bashrc
 RUN echo 'export PATH=/usr/local/cuda/bin:${PATH}' >> /root/.bashrc
+
+
+FROM build-base AS build-dev
+
+RUN pip install ipython mypy black
+
+CMD ["echo", "Let's talk about it"]
