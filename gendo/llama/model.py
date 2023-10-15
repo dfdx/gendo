@@ -159,18 +159,160 @@ def apply_rotary_emb(
     return xq_out.astype(xq.dtype), xk_out.astype(xk.dtype)
 
 
+def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
+    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    bs, slen, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        jnp.tile(x[:, :, :, jnp.newaxis, :], (1, 1, 1, n_rep, 1))
+        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    )
+
+
+class Attention(nn.Module):
+    """
+    Multi-head attention module.
+
+    Args:
+        args (ModelArgs): Model configuration parameters.
+
+    Attributes:
+        n_kv_heads (int): Number of key and value heads.
+        n_rep (int): Number of repetitions for local heads.
+        head_dim (int): Dimension size of each attention head.
+        wq (ColumnParallelLinear): Linear transformation for queries.
+        wk (ColumnParallelLinear): Linear transformation for keys.
+        wv (ColumnParallelLinear): Linear transformation for values.
+        wo (RowParallelLinear): Linear transformation for output.
+        cache_k (torch.Tensor): Cached keys for attention.
+        cache_v (torch.Tensor): Cached values for attention.
+    """
+    args: ModelArgs
+
+    def setup(self):
+        self.n_heads = self.args.n_heads
+        self.n_kv_heads = self.n_heads if self.args.n_kv_heads is None else self.args.n_kv_heads
+
+        self.n_rep = self.n_heads // self.n_kv_heads
+        self.head_dim = self.args.dim // self.n_heads
+
+        self.wq = nn.Dense(
+            self.n_heads * self.head_dim,
+            use_bias=False,
+            # kernel_init=lambda x: x,
+        )
+        self.wk = nn.Dense(
+            self.n_kv_heads * self.head_dim,
+            use_bias=False,
+            # kernel_init=lambda x: x,
+        )
+        self.wv = nn.Dense(
+            self.n_kv_heads * self.head_dim,
+            use_bias=False,
+            # kernel_init=lambda x: x,
+        )
+        self.wo = nn.Dense(
+            self.args.dim,
+            use_bias=False,
+        )
+
+        # self.cache_k = torch.zeros(
+        #     (
+        #         args.max_batch_size,
+        #         args.max_seq_len,
+        #         self.n_local_kv_heads,
+        #         self.head_dim,
+        #     )
+        # ).cuda()
+        # self.cache_v = torch.zeros(
+        #     (
+        #         args.max_batch_size,
+        #         args.max_seq_len,
+        #         self.n_local_kv_heads,
+        #         self.head_dim,
+        #     )
+        # ).cuda()
+
+    def __call__(
+        self,
+        cache: Tuple[jax.Array, jax.Array],
+        x: jax.Array,
+        start_pos: int,
+        freqs_cis: jax.Array,
+        mask: Optional[jax.Array],
+    ):
+        """
+        Forward pass of the attention module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            start_pos (int): Starting position for caching.
+            freqs_cis (torch.Tensor): Precomputed frequency tensor.
+            mask (torch.Tensor, optional): Attention mask tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after attention.
+
+        """
+
+        bsz, seqlen, _ = x.shape
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        xq = xq.reshape(bsz, seqlen, self.n_heads, self.head_dim)
+        xk = xk.reshape(bsz, seqlen, self.n_kv_heads, self.head_dim)
+        xv = xv.reshape(bsz, seqlen, self.n_kv_heads, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        print(type(cache))
+        cache_k, cache_v = cache
+        # self.cache_k = self.cache_k.to(xq)
+        # self.cache_v = self.cache_v.to(xq)
+
+        cache_k = cache_k.at[:bsz, start_pos : start_pos + seqlen].set(xk)
+        cache_v = cache_v.at[:bsz, start_pos : start_pos + seqlen].set(xv)
+
+        keys = cache_k[:bsz, : start_pos + seqlen]
+        values = cache_v[:bsz, : start_pos + seqlen]
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(keys, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        values = repeat_kv(values, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+
+        xq = jnp.moveaxis(xq, 1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        keys = jnp.moveaxis(keys, 1, 2)
+        values = jnp.moveaxis(values, 1, 2)
+
+        scores = jnp.matmul(xq, jnp.moveaxis(keys, 2, 3)) / math.sqrt(self.head_dim)
+        # scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        if mask is not None:
+            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+        # scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        scores = nn.softmax(scores.astype("float32"), axis=-1).astype(xq.dtype)
+        output = jnp.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        output = jnp.moveaxis(output, 1, 2).ravel().reshape(bsz, seqlen, -1)
+        return (cache_k, cache_v), self.wo(output)
+
+
 def main():
     import torch
     import numpy as np
 
-    batch_size, dim = (3, 4)
+    bsz, seqlen, dim = (2, 5, 8)
     rng = jax.random.PRNGKey(925)
-    x = jax.random.normal(rng, (batch_size, dim))
-    # xt = torch.from_numpy(np.asarray(x))
-    self = RMSNorm(dim)
-    variables = self.init(rng, x)
+    x = jax.random.normal(rng, (bsz, seqlen, dim))
+    cache = (
+        jnp.zeros((16, 32, 32, 128)),
+        jnp.zeros((16, 32, 32, 128)),
+    )
+    args = ModelArgs()
+    freqs_cis = precompute_freqs_cis(128, seqlen)
+    self = Attention(args)
+    variables = self.init(rng, cache, x, 0, freqs_cis, None)
     self = self.bind(variables)
-    out = self.apply(variables, x)
+    cache, out = self.apply(variables, cache, x, 0, freqs_cis, None)
     # TODO: check with PyTorch
 
 
@@ -234,3 +376,45 @@ def test_apply_rotary_embeddings():
     out = apply_rotary_emb(xq, xk, freqs_cis)
     pt_out = pt_apply_rotary_embeddings(to_pytorch(xq), to_pytorch(xk), to_pytorch(freqs_cis))
     assert jnp.allclose(out[0], to_jax(pt_out[0]))
+
+
+def test_repeat_kv():
+    from gendo.llama.model_pt import repeat_kv as pt_repeat_kw
+    rng = jax.random.PRNGKey(134)
+    x = jax.random.normal(rng, (5, 4, 3, 2))
+    out = repeat_kv(x, 6)
+    pt_x = to_pytorch(x)
+    pt_out = pt_repeat_kw(pt_x, 6)
+    assert jnp.allclose(out, to_jax(pt_out))
+
+
+def init_pseudo_distributed():
+    import torch
+    from fairscale.nn.model_parallel.initialize import initialize_model_parallel, model_parallel_is_initialized
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group("gloo", init_method="file:///tmp/test", rank=0, world_size=1)
+    if not model_parallel_is_initialized():
+        initialize_model_parallel(1)
+
+def test_attention():
+    # TODO: finish this test when GPU is available
+    from gendo.llama.model_pt import Attention as PtAttention
+    init_pseudo_distributed()
+
+    # import torch
+    # import numpy as np
+    bsz, seqlen, dim = (2, 5, 8)
+    rng = jax.random.PRNGKey(925)
+    x = jax.random.normal(rng, (bsz, seqlen, dim))
+    cache = (
+        jnp.zeros((16, 32, 32, 128)),
+        jnp.zeros((16, 32, 32, 128)),
+    )
+    args = ModelArgs()
+    freqs_cis = precompute_freqs_cis(128, seqlen)
+    attn = Attention(args)
+    variables = attn.init(rng, cache, x, 0, freqs_cis, None)
+    # attn = self.bind(variables)
+    cache, out = attn.apply(variables, cache, x, 0, freqs_cis, None)
+
+    pt_attn = PtAttention(args)
