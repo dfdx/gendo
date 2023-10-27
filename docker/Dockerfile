@@ -92,6 +92,7 @@ RUN echo 'export PATH=/usr/local/cuda/bin:${PATH}' >> /root/.bashrc
 
 FROM build-base AS build-dev
 
-RUN pip install ipython mypy black
+RUN pip install fairscale multimethod
+RUN pip install pytest ipython mypy black
 
 CMD ["echo", "Let's talk about it"]
