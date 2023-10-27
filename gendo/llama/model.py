@@ -308,66 +308,30 @@ class FeedForward(nn.Module):
             w3 (Linear): Linear transformation for the third layer.
 
         """
-        self.hidden_dim = int(2 * self.hidden_dim / 3)
+        hidden_dim = self.hidden_dim
+        hidden_dim = int(2 * hidden_dim / 3)
         # custom dim factor multiplier
         if self.ffn_dim_multiplier is not None:
-            self.hidden_dim = int(self.ffn_dim_multiplier * self.hidden_dim)
-        self.hidden_dim = self.multiple_of * (
-            (self.hidden_dim + self.multiple_of - 1) // self.multiple_of
+            hidden_dim = int(self.ffn_dim_multiplier * hidden_dim)
+        hidden_dim = self.multiple_of * (
+            (hidden_dim + self.multiple_of - 1) // self.multiple_of
         )
 
-        self.w1 = nn.Linear(
-            self.hidden_dim,
+        self.w1 = nn.Dense(
+            hidden_dim,
             use_bias=False,  # gather_output=False, init_method=lambda x: x
         )
-        self.w2 = nn.Linear(
+        self.w2 = nn.Dense(
             self.dim,
             use_bias=False,  # input_is_parallel=True, init_method=lambda x: x
         )
-        self.w3 = nn.Linear(
-            self.hidden_dim,
+        self.w3 = nn.Dense(
+            hidden_dim,
             use_bias=False,  # gather_output=False, init_method=lambda x: x
         )
 
     def __call__(self, x):
         return self.w2(nn.silu(self.w1(x)) * self.w3(x))
-
-
-def test_feedforward():
-    from gendo.llama.model_pt import FeedForward as PtFeedForward
-
-    init_pseudo_distributed()
-
-    args = ModelArgs()
-    bsz, seqlen, dim = (2, 5, args.dim)
-    rng = jax.random.PRNGKey(925)
-    x = jax.random.normal(rng, (bsz, seqlen, dim))
-    cache = (
-        jnp.zeros((16, 32, 32, 128)),
-        jnp.zeros((16, 32, 32, 128)),
-    )
-
-    freqs_cis = precompute_freqs_cis(128, seqlen)
-    attn = Attention(args)
-    variables = attn.init(rng, cache, x, 0, freqs_cis, None)
-    cache_out, out = attn.apply(variables, cache, x, 0, freqs_cis, None)
-
-    pt_attn = PtAttention(args)
-    # fill_from_jax(pt_attn, variables["params"])
-    params = variables["params"]
-    pt_attn.wq.weight.data = to_pytorch(params["wq"]["kernel"].T)
-    pt_attn.wk.weight.data = to_pytorch(params["wk"]["kernel"].T)
-    pt_attn.wv.weight.data = to_pytorch(params["wv"]["kernel"].T)
-    pt_attn.wo.weight.data = to_pytorch(params["wo"]["kernel"].T)
-    pt_attn.cache_k = to_pytorch(cache[0])
-    pt_attn.cache_v = to_pytorch(cache[1])
-
-    pt_x = to_pytorch(x)
-    pt_freqs_cis = to_pytorch(freqs_cis)
-    pt_out = pt_attn(pt_x, 0, pt_freqs_cis, None)
-    assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)
-    assert jnp.allclose(to_jax(pt_attn.cache_k), cache_out[0], atol=1e-2)
-    assert jnp.allclose(to_jax(pt_attn.cache_v), cache_out[1], atol=1e-2)
 
 
 def main():

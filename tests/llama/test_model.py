@@ -11,6 +11,7 @@ from gendo.llama.model import (
     ModelArgs,
     RMSNorm,
     Attention,
+    FeedForward,
     precompute_freqs_cis,
     view_as_complex,
     view_as_real,
@@ -130,3 +131,29 @@ def test_attention():
     assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)
     assert jnp.allclose(to_jax(pt_attn.cache_k), cache_out[0], atol=1e-2)
     assert jnp.allclose(to_jax(pt_attn.cache_v), cache_out[1], atol=1e-2)
+
+
+def test_feedforward():
+    from gendo.llama.model_pt import FeedForward as PtFeedForward
+
+    init_pseudo_distributed()
+
+    args = ModelArgs()
+    bsz, seqlen, dim = (2, 5, args.dim)
+    rng = jax.random.PRNGKey(925)
+    x = jax.random.normal(rng, (bsz, seqlen, dim))
+
+    # freqs_cis = precompute_freqs_cis(128, seqlen)
+    ff = FeedForward(args.dim, args.dim // 2, args.multiple_of, args.ffn_dim_multiplier)
+    variables = ff.init(rng, x)
+    out = ff.apply(variables, x)
+
+    pt_ff = PtFeedForward(args.dim, args.dim // 2, args.multiple_of, args.ffn_dim_multiplier)
+    params = variables["params"]
+    pt_ff.w1.weight.data = to_pytorch(params["w1"]["kernel"].T)
+    pt_ff.w2.weight.data = to_pytorch(params["w2"]["kernel"].T)
+    pt_ff.w3.weight.data = to_pytorch(params["w3"]["kernel"].T)
+
+    pt_x = to_pytorch(x)
+    pt_out = pt_ff(pt_x)
+    assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)
