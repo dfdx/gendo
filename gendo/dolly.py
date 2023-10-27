@@ -3,7 +3,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     PreTrainedModel,
-    PreTrainedTokenizer
+    PreTrainedTokenizer,
 )
 
 
@@ -15,16 +15,36 @@ PROMPT_FORMAT = """Below is an instruction that describes a task. Write a respon
 ### Response:
 """
 
-def generate_response(instruction: str, *, model: PreTrainedModel, tokenizer: PreTrainedTokenizer,
-                      do_sample: bool = True, max_new_tokens: int = 256, top_p: float = 0.92, top_k: int = 0, **kwargs) -> str:
-    input_ids = tokenizer(PROMPT_FORMAT.format(instruction=instruction), return_tensors="pt").input_ids.to("cuda")
+
+def generate_response(
+    instruction: str,
+    *,
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    do_sample: bool = True,
+    max_new_tokens: int = 256,
+    top_p: float = 0.92,
+    top_k: int = 0,
+    **kwargs,
+) -> str:
+    input_ids = tokenizer(
+        PROMPT_FORMAT.format(instruction=instruction), return_tensors="pt"
+    ).input_ids.to("cuda")
 
     # each of these is encoded to a single token
     response_key_token_id = tokenizer.encode("### Response:")[0]
     end_key_token_id = tokenizer.encode("### End")[0]
 
-    gen_tokens = model.generate(input_ids, pad_token_id=tokenizer.pad_token_id, eos_token_id=end_key_token_id,
-                                do_sample=do_sample, max_new_tokens=max_new_tokens, top_p=top_p, top_k=top_k, **kwargs)[0].cpu()
+    gen_tokens = model.generate(
+        input_ids,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=end_key_token_id,
+        do_sample=do_sample,
+        max_new_tokens=max_new_tokens,
+        top_p=top_p,
+        top_k=top_k,
+        **kwargs,
+    )[0].cpu()
 
     # find where the response begins
     response_positions = np.where(gen_tokens == response_key_token_id)[0]
@@ -49,8 +69,12 @@ def main():
     # FlaxAutoModelForCausalLM.from_pretrained("databricks/dolly-v1-6b", device_map="auto", trust_remote_code=True)
     # FlaxGPTJForCausalLMModule()
 
-    tokenizer = AutoTokenizer.from_pretrained("databricks/dolly-v1-6b", padding_side="left")
-    model = AutoModelForCausalLM.from_pretrained("databricks/dolly-v1-6b", device_map="auto", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        "databricks/dolly-v1-6b", padding_side="left"
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        "databricks/dolly-v1-6b", device_map="auto", trust_remote_code=True
+    )
     # Sample similar to: "Excited to announce the release of Dolly, a powerful new language model from Databricks! #AI #Databricks"
 
     text = """
@@ -65,5 +89,7 @@ def main():
 
     And so Katty jumped into the nearest train car.
     """
-    out = generate_response(f"summarize in less than 100 words: {text}", model=model, tokenizer=tokenizer)
+    out = generate_response(
+        f"summarize in less than 100 words: {text}", model=model, tokenizer=tokenizer
+    )
     print(out)

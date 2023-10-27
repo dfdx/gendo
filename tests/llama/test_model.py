@@ -1,5 +1,10 @@
 import jax
 import jax.numpy as jnp
+import torch
+from fairscale.nn.model_parallel.initialize import (
+    initialize_model_parallel,
+    model_parallel_is_initialized,
+)
 
 from gendo.llama.convert import to_jax, to_pytorch
 from gendo.llama.model import (
@@ -14,6 +19,15 @@ from gendo.llama.model import (
 )
 
 
+def init_pseudo_distributed():
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(
+            "gloo", init_method="file:///tmp/test", rank=0, world_size=1
+        )
+    if not model_parallel_is_initialized():
+        initialize_model_parallel(1)
+
+
 def compare_with_pytorch(module, pt_module, rng, *args):
     # jax
     variables = module.init(rng, *args)
@@ -26,6 +40,7 @@ def compare_with_pytorch(module, pt_module, rng, *args):
 
 def test_rmsnorm():
     from gendo.llama.model_pt import RMSNorm as PtRMSNorm
+
     batch_size, dim = (3, 4)
     rng = jax.random.PRNGKey(925)
     x = jax.random.normal(rng, (batch_size, dim))
@@ -34,6 +49,7 @@ def test_rmsnorm():
 
 def test_precompute_freqs_cis():
     from gendo.llama.model_pt import precompute_freqs_cis as pt_precompute_freqs_cis
+
     res = precompute_freqs_cis(32, 8)
     pt_res = pt_precompute_freqs_cis(32, 8)
     assert jnp.allclose(res, to_jax(pt_res))
@@ -41,6 +57,7 @@ def test_precompute_freqs_cis():
 
 def test_complex_conversions():
     import torch
+
     rng = jax.random.PRNGKey(396)
     x = jax.random.normal(rng, (4, 3, 2))
     cx = view_as_complex(x)
@@ -53,6 +70,7 @@ def test_complex_conversions():
 
 def test_apply_rotary_embeddings():
     from gendo.llama.model_pt import apply_rotary_emb as pt_apply_rotary_embeddings
+
     rng = jax.random.PRNGKey(71)
     rng_q, rng_k = jax.random.split(rng, 2)
     batch_dim, seq_len, dim = 4, 3, 2
@@ -60,12 +78,15 @@ def test_apply_rotary_embeddings():
     xk = jax.random.normal(rng_k, (batch_dim, seq_len, dim))
     freqs_cis = precompute_freqs_cis(dim, seq_len)
     out = apply_rotary_emb(xq, xk, freqs_cis)
-    pt_out = pt_apply_rotary_embeddings(to_pytorch(xq), to_pytorch(xk), to_pytorch(freqs_cis))
+    pt_out = pt_apply_rotary_embeddings(
+        to_pytorch(xq), to_pytorch(xk), to_pytorch(freqs_cis)
+    )
     assert jnp.allclose(out[0], to_jax(pt_out[0]))
 
 
 def test_repeat_kv():
     from gendo.llama.model_pt import repeat_kv as pt_repeat_kw
+
     rng = jax.random.PRNGKey(134)
     x = jax.random.normal(rng, (5, 4, 3, 2))
     out = repeat_kv(x, 6)
@@ -74,17 +95,9 @@ def test_repeat_kv():
     assert jnp.allclose(out, to_jax(pt_out))
 
 
-def init_pseudo_distributed():
-    import torch
-    from fairscale.nn.model_parallel.initialize import initialize_model_parallel, model_parallel_is_initialized
-    if not torch.distributed.is_initialized():
-        torch.distributed.init_process_group("gloo", init_method="file:///tmp/test", rank=0, world_size=1)
-    if not model_parallel_is_initialized():
-        initialize_model_parallel(1)
-
-
 def test_attention():
     from gendo.llama.model_pt import Attention as PtAttention
+
     init_pseudo_distributed()
 
     args = ModelArgs()

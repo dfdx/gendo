@@ -5,9 +5,9 @@ import jax.numpy as jnp
 import torch
 
 
-
 def to_pytorch(x):
     return torch.from_numpy(np.asarray(x).copy())
+
 
 def to_jax(pt_x):
     return jnp.array(pt_x.detach().numpy())

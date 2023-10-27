@@ -53,7 +53,9 @@ class RMSNorm(nn.Module):
             jax.Array: The normalized array.
 
         """
-        return x * jax.lax.rsqrt(jnp.power(x, 2).mean(axis=-1, keepdims=True) + self.eps)
+        return x * jax.lax.rsqrt(
+            jnp.power(x, 2).mean(axis=-1, keepdims=True) + self.eps
+        )
 
     def __call__(self, x):
         """
@@ -90,7 +92,9 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     Returns:
         jax.Array: Precomputed frequency array with complex exponentials.
     """
-    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype("float32") / dim))
+    freqs = 1.0 / (
+        theta ** (jnp.arange(0, dim, 2)[: (dim // 2)].astype("float32") / dim)
+    )
     t = jnp.arange(end)
     freqs = jnp.outer(t, freqs).astype("float32")
     freqs_cis = polar(jnp.ones(freqs.shape, dtype=freqs.dtype), freqs)  # complex64
@@ -124,6 +128,7 @@ def reshape_for_broadcast(freqs_cis: jax.Array, x: jax.Array):
 
 def view_as_complex(x: jax.Array):
     return jax.lax.complex(x[..., 0], x[..., 1])
+
 
 def view_as_real(cx: jax.Array):
     return jnp.stack([jnp.real(cx), jnp.imag(cx)], axis=-1)
@@ -165,9 +170,8 @@ def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
     bs, slen, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
-    return (
-        jnp.tile(x[:, :, :, jnp.newaxis, :], (1, 1, 1, n_rep, 1))
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    return jnp.tile(x[:, :, :, jnp.newaxis, :], (1, 1, 1, n_rep, 1)).reshape(
+        bs, slen, n_kv_heads * n_rep, head_dim
     )
 
 
@@ -189,11 +193,14 @@ class Attention(nn.Module):
         cache_k (torch.Tensor): Cached keys for attention.
         cache_v (torch.Tensor): Cached values for attention.
     """
+
     args: ModelArgs
 
     def setup(self):
         self.n_heads = self.args.n_heads
-        self.n_kv_heads = self.n_heads if self.args.n_kv_heads is None else self.args.n_kv_heads
+        self.n_kv_heads = (
+            self.n_heads if self.args.n_kv_heads is None else self.args.n_kv_heads
+        )
 
         self.n_rep = self.n_heads // self.n_kv_heads
         self.head_dim = self.args.dim // self.n_heads
@@ -279,6 +286,90 @@ class Attention(nn.Module):
         return (cache_k, cache_v), self.wo(output)
 
 
+class FeedForward(nn.Module):
+    dim: int
+    hidden_dim: int
+    multiple_of: int
+    ffn_dim_multiplier: Optional[float]
+
+    def setup(self):
+        """
+        Initialize the FeedForward module.
+
+        Args:
+            dim (int): Input dimension.
+            hidden_dim (int): Hidden dimension of the feedforward layer.
+            multiple_of (int): Value to ensure hidden dimension is a multiple of this value.
+            ffn_dim_multiplier (float, optional): Custom multiplier for hidden dimension. Defaults to None.
+
+        Attributes:
+            w1 (Linear): Linear transformation for the first layer.
+            w2 (Linear): Linear transformation for the second layer.
+            w3 (Linear): Linear transformation for the third layer.
+
+        """
+        self.hidden_dim = int(2 * self.hidden_dim / 3)
+        # custom dim factor multiplier
+        if self.ffn_dim_multiplier is not None:
+            self.hidden_dim = int(self.ffn_dim_multiplier * self.hidden_dim)
+        self.hidden_dim = self.multiple_of * (
+            (self.hidden_dim + self.multiple_of - 1) // self.multiple_of
+        )
+
+        self.w1 = nn.Linear(
+            self.hidden_dim,
+            use_bias=False,  # gather_output=False, init_method=lambda x: x
+        )
+        self.w2 = nn.Linear(
+            self.dim,
+            use_bias=False,  # input_is_parallel=True, init_method=lambda x: x
+        )
+        self.w3 = nn.Linear(
+            self.hidden_dim,
+            use_bias=False,  # gather_output=False, init_method=lambda x: x
+        )
+
+    def __call__(self, x):
+        return self.w2(nn.silu(self.w1(x)) * self.w3(x))
+
+
+def test_feedforward():
+    from gendo.llama.model_pt import FeedForward as PtFeedForward
+
+    init_pseudo_distributed()
+
+    args = ModelArgs()
+    bsz, seqlen, dim = (2, 5, args.dim)
+    rng = jax.random.PRNGKey(925)
+    x = jax.random.normal(rng, (bsz, seqlen, dim))
+    cache = (
+        jnp.zeros((16, 32, 32, 128)),
+        jnp.zeros((16, 32, 32, 128)),
+    )
+
+    freqs_cis = precompute_freqs_cis(128, seqlen)
+    attn = Attention(args)
+    variables = attn.init(rng, cache, x, 0, freqs_cis, None)
+    cache_out, out = attn.apply(variables, cache, x, 0, freqs_cis, None)
+
+    pt_attn = PtAttention(args)
+    # fill_from_jax(pt_attn, variables["params"])
+    params = variables["params"]
+    pt_attn.wq.weight.data = to_pytorch(params["wq"]["kernel"].T)
+    pt_attn.wk.weight.data = to_pytorch(params["wk"]["kernel"].T)
+    pt_attn.wv.weight.data = to_pytorch(params["wv"]["kernel"].T)
+    pt_attn.wo.weight.data = to_pytorch(params["wo"]["kernel"].T)
+    pt_attn.cache_k = to_pytorch(cache[0])
+    pt_attn.cache_v = to_pytorch(cache[1])
+
+    pt_x = to_pytorch(x)
+    pt_freqs_cis = to_pytorch(freqs_cis)
+    pt_out = pt_attn(pt_x, 0, pt_freqs_cis, None)
+    assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)
+    assert jnp.allclose(to_jax(pt_attn.cache_k), cache_out[0], atol=1e-2)
+    assert jnp.allclose(to_jax(pt_attn.cache_v), cache_out[1], atol=1e-2)
+
+
 def main():
     import torch
     import numpy as np
@@ -297,8 +388,3 @@ def main():
     self = self.bind(variables)
     cache, out = self.apply(variables, cache, x, 0, freqs_cis, None)
     # TODO: check with PyTorch
-
-
-
-
-

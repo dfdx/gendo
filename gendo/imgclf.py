@@ -13,6 +13,7 @@ from flax.training.train_state import TrainState
 from transformers import FlaxCLIPModel, CLIPImageProcessor
 
 from jax.config import config
+
 config.update("jax_debug_nans", True)
 
 
@@ -40,8 +41,10 @@ def train_step(state: TrainState, batch):
     def loss_fn(params):
         logits = state.apply_fn({"params": params}, batch["image"])
         loss = optax.softmax_cross_entropy_with_integer_labels(
-            logits=logits, labels=batch['label']).mean()
+            logits=logits, labels=batch["label"]
+        ).mean()
         return loss
+
     grad_fn = jax.value_and_grad(loss_fn)
     loss, grads = grad_fn(state.params)
     state = state.apply_gradients(grads=grads)
@@ -90,7 +93,9 @@ def main():
         for i, batch_ in enumerate(pbar):
             imgs, labels = batch_["image"], batch_["label"]
             batch = {
-                "image": jnp.moveaxis(jnp.stack(proc(imgs)["pixel_values"], axis=0), 1, -1),
+                "image": jnp.moveaxis(
+                    jnp.stack(proc(imgs)["pixel_values"], axis=0), 1, -1
+                ),
                 "label": jnp.array([label2idx[lbl.item()] for lbl in labels]),
             }
             state, loss = train_step(state, batch)
