@@ -6,17 +6,18 @@ from fairscale.nn.model_parallel.initialize import (
     model_parallel_is_initialized,
 )
 
-from gendo.llama.convert import to_jax, to_pytorch
+from gendo.llama.convert import to_jax, to_pytorch, fill_pytorch
 from gendo.llama.model import (
-    ModelArgs,
-    RMSNorm,
-    Attention,
-    FeedForward,
     precompute_freqs_cis,
     view_as_complex,
     view_as_real,
     apply_rotary_emb,
     repeat_kv,
+    ModelArgs,
+    RMSNorm,
+    Attention,
+    FeedForward,
+    TransformerBlock,
 )
 
 
@@ -157,3 +158,33 @@ def test_feedforward():
     pt_x = to_pytorch(x)
     pt_out = pt_ff(pt_x)
     assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)
+
+
+def test_transformerblock():
+    from gendo.llama.model_pt import TransformerBlock as PtTransformerBlock
+
+    init_pseudo_distributed()
+
+    args = ModelArgs()
+    bsz, seqlen, dim = (2, 5, args.dim)
+    rng = jax.random.PRNGKey(925)
+    x = jax.random.normal(rng, (bsz, seqlen, dim))
+    cache = (
+        jnp.zeros((args.max_batch_size, args.max_seq_len, 32, 128)),
+        jnp.zeros((args.max_batch_size, args.max_seq_len, 32, 128)),
+    )
+    freqs_cis = precompute_freqs_cis(128, seqlen)
+    block = TransformerBlock(0, args)
+    variables = block.init(rng, cache, x, 0, freqs_cis, None)
+    attn_cache_out, out = block.apply(variables, cache, x, 0, freqs_cis, None)
+
+    pt_block = PtTransformerBlock(0, args)
+    # fill_from_jax(pt_attn, variables["params"])
+    fill_pytorch(pt_block, variables["params"])
+
+    pt_x = to_pytorch(x)
+    pt_freqs_cis = to_pytorch(freqs_cis)
+    pt_out = pt_block(pt_x, 0, pt_freqs_cis, None)
+    assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)
+    assert jnp.allclose(to_jax(pt_block.attention.cache_k), attn_cache_out[0], atol=1e-2)
+    assert jnp.allclose(to_jax(pt_block.attention.cache_v), attn_cache_out[1], atol=1e-2)

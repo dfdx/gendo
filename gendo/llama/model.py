@@ -334,21 +334,118 @@ class FeedForward(nn.Module):
         return self.w2(nn.silu(self.w1(x)) * self.w3(x))
 
 
-def main():
-    import torch
-    import numpy as np
+class TransformerBlock(nn.Module):
+    layer_id: int
+    args: ModelArgs
 
-    bsz, seqlen, dim = (2, 5, 8)
+    def setup(self):
+        """
+        Initialize a TransformerBlock.
+
+        Args:
+            layer_id (int): Identifier for the layer.
+            args (ModelArgs): Model configuration parameters.
+
+        Attributes:
+            n_heads (int): Number of attention heads.
+            dim (int): Dimension size of the model.
+            head_dim (int): Dimension size of each attention head.
+            attention (Attention): Attention module.
+            feed_forward (FeedForward): FeedForward module.
+            layer_id (int): Identifier for the layer.
+            attention_norm (RMSNorm): Layer normalization for attention output.
+            ffn_norm (RMSNorm): Layer normalization for feedforward output.
+
+        """
+        args = self.args
+        self.n_heads = args.n_heads
+        self.dim = args.dim
+        self.head_dim = args.dim // args.n_heads
+        self.attention = Attention(args)
+        self.feed_forward = FeedForward(
+            dim=args.dim,
+            hidden_dim=4 * args.dim,
+            multiple_of=args.multiple_of,
+            ffn_dim_multiplier=args.ffn_dim_multiplier,
+        )
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+
+    def __call__(
+        self,
+        attn_cache: Tuple[jax.Array, jax.Array],
+        x: jax.Array,
+        start_pos: int,
+        freqs_cis: jax.Array,
+        mask: Optional[jax.Array],
+    ):
+        """
+        Perform a forward pass through the TransformerBlock.
+
+        Args:
+            attn_cache (Tuple[jax.Array, jax.Array]): key and value cache.
+            x (jax.Array): Input array.
+            start_pos (int): Starting position for attention caching.
+            freqs_cis (jax.Array): Precomputed cosine and sine frequencies.
+            mask (jax.Array, optional): Masking tensor for attention. Defaults to None.
+
+        Returns:
+            jax.Array: Output tensor after applying attention and feedforward layers.
+
+        """
+        attn_cache_out, attn_out = self.attention(
+            attn_cache, self.attention_norm(x), start_pos, freqs_cis, mask
+        )
+        h = x + attn_out
+        out = h + self.feed_forward(self.ffn_norm(h))
+        return attn_cache_out, out
+
+
+
+def main():
+    args = ModelArgs()
+    bsz, seqlen, dim = (2, 5, args.dim)
     rng = jax.random.PRNGKey(925)
     x = jax.random.normal(rng, (bsz, seqlen, dim))
     cache = (
         jnp.zeros((16, 32, 32, 128)),
         jnp.zeros((16, 32, 32, 128)),
     )
-    args = ModelArgs()
     freqs_cis = precompute_freqs_cis(128, seqlen)
-    self = Attention(args)
+    self = TransformerBlock(0, args)
     variables = self.init(rng, cache, x, 0, freqs_cis, None)
-    self = self.bind(variables)
-    cache, out = self.apply(variables, cache, x, 0, freqs_cis, None)
-    # TODO: check with PyTorch
+    attn_cache_out, out = self.apply(variables, cache, x, 0, freqs_cis, None)
+
+
+
+
+
+
+def test_transformerblock():
+    from gendo.llama.model_pt import TransformerBlock as PtTransformerBlock
+
+    init_pseudo_distributed()
+
+    args = ModelArgs()
+    bsz, seqlen, dim = (2, 5, args.dim)
+    rng = jax.random.PRNGKey(925)
+    x = jax.random.normal(rng, (bsz, seqlen, dim))
+    cache = (
+        jnp.zeros((args.max_batch_size, args.max_seq_len, 32, 128)),
+        jnp.zeros((args.max_batch_size, args.max_seq_len, 32, 128)),
+    )
+    freqs_cis = precompute_freqs_cis(128, seqlen)
+    block = TransformerBlock(0, args)
+    variables = block.init(rng, cache, x, 0, freqs_cis, None)
+    attn_cache_out, out = block.apply(variables, cache, x, 0, freqs_cis, None)
+
+    pt_block = PtTransformerBlock(0, args)
+    # fill_from_jax(pt_attn, variables["params"])
+    fill_pytorch(pt_block, variables["params"])
+
+    pt_x = to_pytorch(x)
+    pt_freqs_cis = to_pytorch(freqs_cis)
+    pt_out = pt_block(pt_x, 0, pt_freqs_cis, None)
+    assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)
+    assert jnp.allclose(to_jax(pt_block.attention.cache_k), attn_cache_out[0], atol=1e-2)
+    assert jnp.allclose(to_jax(pt_block.attention.cache_v), attn_cache_out[1], atol=1e-2)
