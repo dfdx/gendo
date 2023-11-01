@@ -224,10 +224,31 @@ class Attention(nn.Module):
             self.args.dim,
             use_bias=False,
         )
+        self.cache_k = self.variable(
+            "cache",
+            "cache_k",
+            jnp.zeros,
+            (
+                self.args.max_batch_size,
+                self.args.max_seq_len,
+                self.n_kv_heads,
+                self.head_dim,
+            ),
+        )
+        self.cache_v = self.variable(
+            "cache",
+            "cache_v",
+            jnp.zeros,
+            (
+                self.args.max_batch_size,
+                self.args.max_seq_len,
+                self.n_kv_heads,
+                self.head_dim,
+            ),
+        )
 
     def __call__(
         self,
-        cache: Tuple[jax.Array, jax.Array],
         x: jax.Array,
         start_pos: int,
         freqs_cis: jax.Array,
@@ -237,7 +258,6 @@ class Attention(nn.Module):
         Forward pass of the attention module.
 
         Args:
-            cache (Tuple[jax.Array, jax.Array]): key and value cache.
             x (jax.Array): Input array.
             start_pos (int): Starting position for caching.
             freqs_cis (jax.Array): Precomputed frequency array.
@@ -256,15 +276,11 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        cache_k, cache_v = cache
-        # self.cache_k = self.cache_k.to(xq)
-        # self.cache_v = self.cache_v.to(xq)
+        self.cache_k.value = self.cache_k.value.at[:bsz, start_pos : start_pos + seqlen].set(xk)
+        self.cache_v.value = self.cache_v.value.at[:bsz, start_pos : start_pos + seqlen].set(xv)
 
-        cache_k = cache_k.at[:bsz, start_pos : start_pos + seqlen].set(xk)
-        cache_v = cache_v.at[:bsz, start_pos : start_pos + seqlen].set(xv)
-
-        keys = cache_k[:bsz, : start_pos + seqlen]
-        values = cache_v[:bsz, : start_pos + seqlen]
+        keys = self.cache_k.value[:bsz, : start_pos + seqlen]
+        values = self.cache_v.value[:bsz, : start_pos + seqlen]
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
@@ -283,7 +299,7 @@ class Attention(nn.Module):
         scores = nn.softmax(scores.astype("float32"), axis=-1).astype(xq.dtype)
         output = jnp.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = jnp.moveaxis(output, 1, 2).ravel().reshape(bsz, seqlen, -1)
-        return (cache_k, cache_v), self.wo(output)
+        return self.wo(output)
 
 
 class FeedForward(nn.Module):
@@ -373,7 +389,6 @@ class TransformerBlock(nn.Module):
 
     def __call__(
         self,
-        attn_cache: Tuple[jax.Array, jax.Array],
         x: jax.Array,
         start_pos: int,
         freqs_cis: jax.Array,
@@ -383,7 +398,6 @@ class TransformerBlock(nn.Module):
         Perform a forward pass through the TransformerBlock.
 
         Args:
-            attn_cache (Tuple[jax.Array, jax.Array]): key and value cache.
             x (jax.Array): Input array.
             start_pos (int): Starting position for attention caching.
             freqs_cis (jax.Array): Precomputed cosine and sine frequencies.
@@ -393,59 +407,108 @@ class TransformerBlock(nn.Module):
             jax.Array: Output tensor after applying attention and feedforward layers.
 
         """
-        attn_cache_out, attn_out = self.attention(
-            attn_cache, self.attention_norm(x), start_pos, freqs_cis, mask
+        h = x + self.attention(
+            self.attention_norm(x), start_pos, freqs_cis, mask
         )
-        h = x + attn_out
         out = h + self.feed_forward(self.ffn_norm(h))
-        return attn_cache_out, out
+        return out
 
+
+class Transformer(nn.Module):
+    args: ModelArgs
+
+    def setup(self):
+        """
+        Initialize a Transformer model.
+
+        Args:
+            params (ModelArgs): Model configuration parameters.
+
+        Attributes:
+            params (ModelArgs): Model configuration parameters.
+            vocab_size (int): Vocabulary size.
+            n_layers (int): Number of layers in the model.
+            tok_embeddings (ParallelEmbedding): Token embeddings.
+            layers (torch.nn.ModuleList): List of Transformer blocks.
+            norm (RMSNorm): Layer normalization for the model output.
+            output (ColumnParallelLinear): Linear layer for final output.
+            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
+
+        """
+        self.vocab_size = self.args.vocab_size
+        self.n_layers = self.args.n_layers
+
+        self.tok_embeddings = nn.Embed(self.args.vocab_size, self.args.dim)
+
+        self.layers = [
+            TransformerBlock(layer_id, self.args)
+            for layer_id in range(self.args.n_layers)
+        ]
+
+        self.norm = RMSNorm(self.args.dim, eps=self.args.norm_eps)
+        self.output = nn.Dense(self.args.vocab_size, use_bias=False)
+
+        self.freqs_cis = precompute_freqs_cis(
+            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
+            # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
+            self.args.dim // self.args.n_heads,
+            self.args.max_seq_len * 2,
+        )
+
+    def __call__(self, tokens: jax.Array, start_pos: int):
+        """
+        Perform a forward pass through the Transformer model.
+
+        Args:
+            tokens (jax.Array): Input token indices.
+            start_pos (int): Starting position for attention caching.
+
+        Returns:
+            jax.Array: Output logits after applying the Transformer model.
+        """
+        _bsz, seqlen = tokens.shape
+        h = self.tok_embeddings(tokens)
+        # self.freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+
+        mask = None
+        if seqlen > 1:
+            mask = jnp.full((1, 1, seqlen, seqlen), float("-inf"))
+            mask = jnp.triu(mask, k=start_pos + 1).astype(h.dtype)
+        for layer in self.layers:
+            h = layer(h, start_pos, freqs_cis, mask)
+        h = self.norm(h)
+        output = self.output(h).astype("float32")
+        return output
+
+
+def size_gb(variables: dict):
+    from math import prod
+    bytes = sum([prod(x.shape) * 4 for x in tree_util.tree_leaves(variables)])
+    return bytes / (1024 ** 3)
 
 
 def main():
-    args = ModelArgs()
-    bsz, seqlen, dim = (2, 5, args.dim)
+    from gendo.llama.tokenizer import Tokenizer
+
+    args = ModelArgs(max_batch_size=1, max_seq_len=512)
+    tokenizer = Tokenizer(model_path="/data/llama/tokenizer.model")
+    args.vocab_size = tokenizer.n_words
+    tokens = tokenizer.encode("frankenstein walks into a bar", False, False)
+    tokens = jnp.asarray(tokens).reshape(1, -1)
+    bsz, seqlen, dim = (*tokens.shape, args.dim)
     rng = jax.random.PRNGKey(925)
     x = jax.random.normal(rng, (bsz, seqlen, dim))
-    cache = (
-        jnp.zeros((16, 32, 32, 128)),
-        jnp.zeros((16, 32, 32, 128)),
-    )
     freqs_cis = precompute_freqs_cis(128, seqlen)
-    self = TransformerBlock(0, args)
-    variables = self.init(rng, cache, x, 0, freqs_cis, None)
-    attn_cache_out, out = self.apply(variables, cache, x, 0, freqs_cis, None)
+    self = Transformer(args)
+    variables = self.init(rng, tokens, 0)
+    self = self.bind(variables)
+    out = self.apply(variables, x, 0, freqs_cis, None)
 
-
-
-
-
-
-def test_transformerblock():
-    from gendo.llama.model_pt import TransformerBlock as PtTransformerBlock
-
-    init_pseudo_distributed()
-
-    args = ModelArgs()
-    bsz, seqlen, dim = (2, 5, args.dim)
-    rng = jax.random.PRNGKey(925)
-    x = jax.random.normal(rng, (bsz, seqlen, dim))
-    cache = (
-        jnp.zeros((args.max_batch_size, args.max_seq_len, 32, 128)),
-        jnp.zeros((args.max_batch_size, args.max_seq_len, 32, 128)),
-    )
-    freqs_cis = precompute_freqs_cis(128, seqlen)
-    block = TransformerBlock(0, args)
-    variables = block.init(rng, cache, x, 0, freqs_cis, None)
-    attn_cache_out, out = block.apply(variables, cache, x, 0, freqs_cis, None)
-
-    pt_block = PtTransformerBlock(0, args)
-    # fill_from_jax(pt_attn, variables["params"])
-    fill_pytorch(pt_block, variables["params"])
-
-    pt_x = to_pytorch(x)
-    pt_freqs_cis = to_pytorch(freqs_cis)
-    pt_out = pt_block(pt_x, 0, pt_freqs_cis, None)
-    assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)
-    assert jnp.allclose(to_jax(pt_block.attention.cache_k), attn_cache_out[0], atol=1e-2)
-    assert jnp.allclose(to_jax(pt_block.attention.cache_v), attn_cache_out[1], atol=1e-2)
+    layers = []
+    from time import sleep
+    for i in range(32):
+        print(f"layer {i}")
+        layer = TransformerBlock(i, args).init(rng, x, 0, freqs_cis, None)
+        layers.append(layer)
+        sleep(1)

@@ -21,6 +21,10 @@ from gendo.llama.model import (
 )
 
 
+# reduces memory per layer from 2.2Gb to 0.8Gb
+MODEL_ARGS = ModelArgs(max_batch_size=1, max_seq_len=512)
+
+
 def init_pseudo_distributed():
     if not torch.distributed.is_initialized():
         torch.distributed.init_process_group(
@@ -102,19 +106,15 @@ def test_attention():
 
     init_pseudo_distributed()
 
-    args = ModelArgs()
-    bsz, seqlen, dim = (2, 5, args.dim)
+    args = MODEL_ARGS
+    bsz, seqlen, dim = (1, 5, args.dim)
     rng = jax.random.PRNGKey(925)
     x = jax.random.normal(rng, (bsz, seqlen, dim))
-    cache = (
-        jnp.zeros((16, 32, 32, 128)),
-        jnp.zeros((16, 32, 32, 128)),
-    )
 
     freqs_cis = precompute_freqs_cis(128, seqlen)
     attn = Attention(args)
-    variables = attn.init(rng, cache, x, 0, freqs_cis, None)
-    cache_out, out = attn.apply(variables, cache, x, 0, freqs_cis, None)
+    variables = attn.init(rng, x, 0, freqs_cis, None)
+    out, variable_updates = attn.apply(variables, x, 0, freqs_cis, None, mutable=["cache"])
 
     pt_attn = PtAttention(args)
     # fill_from_jax(pt_attn, variables["params"])
@@ -123,15 +123,15 @@ def test_attention():
     pt_attn.wk.weight.data = to_pytorch(params["wk"]["kernel"].T)
     pt_attn.wv.weight.data = to_pytorch(params["wv"]["kernel"].T)
     pt_attn.wo.weight.data = to_pytorch(params["wo"]["kernel"].T)
-    pt_attn.cache_k = to_pytorch(cache[0])
-    pt_attn.cache_v = to_pytorch(cache[1])
+    pt_attn.cache_k = to_pytorch(variables["cache"]["cache_k"])
+    pt_attn.cache_v = to_pytorch(variables["cache"]["cache_v"])
 
     pt_x = to_pytorch(x)
     pt_freqs_cis = to_pytorch(freqs_cis)
     pt_out = pt_attn(pt_x, 0, pt_freqs_cis, None)
     assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)
-    assert jnp.allclose(to_jax(pt_attn.cache_k), cache_out[0], atol=1e-2)
-    assert jnp.allclose(to_jax(pt_attn.cache_v), cache_out[1], atol=1e-2)
+    assert jnp.allclose(to_jax(pt_attn.cache_k), variable_updates["cache"]["cache_k"], atol=1e-2)
+    assert jnp.allclose(to_jax(pt_attn.cache_v), variables["cache"]["cache_v"], atol=1e-2)
 
 
 def test_feedforward():
@@ -139,8 +139,8 @@ def test_feedforward():
 
     init_pseudo_distributed()
 
-    args = ModelArgs()
-    bsz, seqlen, dim = (2, 5, args.dim)
+    args = MODEL_ARGS
+    bsz, seqlen, dim = (1, 5, args.dim)
     rng = jax.random.PRNGKey(925)
     x = jax.random.normal(rng, (bsz, seqlen, dim))
 
@@ -149,7 +149,9 @@ def test_feedforward():
     variables = ff.init(rng, x)
     out = ff.apply(variables, x)
 
-    pt_ff = PtFeedForward(args.dim, args.dim // 2, args.multiple_of, args.ffn_dim_multiplier)
+    pt_ff = PtFeedForward(
+        args.dim, args.dim // 2, args.multiple_of, args.ffn_dim_multiplier
+    )
     params = variables["params"]
     pt_ff.w1.weight.data = to_pytorch(params["w1"]["kernel"].T)
     pt_ff.w2.weight.data = to_pytorch(params["w2"]["kernel"].T)
@@ -165,18 +167,18 @@ def test_transformerblock():
 
     init_pseudo_distributed()
 
-    args = ModelArgs()
-    bsz, seqlen, dim = (2, 5, args.dim)
+    args = MODEL_ARGS
+    bsz, seqlen, dim = (1, 5, args.dim)
     rng = jax.random.PRNGKey(925)
     x = jax.random.normal(rng, (bsz, seqlen, dim))
-    cache = (
-        jnp.zeros((args.max_batch_size, args.max_seq_len, 32, 128)),
-        jnp.zeros((args.max_batch_size, args.max_seq_len, 32, 128)),
-    )
+    # cache = (
+    #     jnp.zeros((args.max_batch_size, args.max_seq_len, 32, 128)),
+    #     jnp.zeros((args.max_batch_size, args.max_seq_len, 32, 128)),
+    # )
     freqs_cis = precompute_freqs_cis(128, seqlen)
     block = TransformerBlock(0, args)
-    variables = block.init(rng, cache, x, 0, freqs_cis, None)
-    attn_cache_out, out = block.apply(variables, cache, x, 0, freqs_cis, None)
+    variables = block.init(rng, x, 0, freqs_cis, None)
+    out, variable_updates = block.apply(variables, x, 0, freqs_cis, None, mutable=["cache"])
 
     pt_block = PtTransformerBlock(0, args)
     # fill_from_jax(pt_attn, variables["params"])
@@ -186,5 +188,9 @@ def test_transformerblock():
     pt_freqs_cis = to_pytorch(freqs_cis)
     pt_out = pt_block(pt_x, 0, pt_freqs_cis, None)
     assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)
-    assert jnp.allclose(to_jax(pt_block.attention.cache_k), attn_cache_out[0], atol=1e-2)
-    assert jnp.allclose(to_jax(pt_block.attention.cache_v), attn_cache_out[1], atol=1e-2)
+    assert jnp.allclose(
+        to_jax(pt_block.attention.cache_k), variable_updates["cache"]["attention"]["cache_k"], atol=1e-2
+    )
+    assert jnp.allclose(
+        to_jax(pt_block.attention.cache_v), variable_updates["cache"]["attention"]["cache_v"], atol=1e-2
+    )
