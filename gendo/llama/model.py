@@ -490,6 +490,9 @@ def size_gb(variables: dict):
 
 def main():
     from gendo.llama.tokenizer import Tokenizer
+    from gendo.llama.model_pt import Transformer as PtTransformer
+
+    init_pseudo_distributed()
 
     args = ModelArgs(max_batch_size=1, max_seq_len=512)
     tokenizer = Tokenizer(model_path="/data/llama/tokenizer.model")
@@ -500,15 +503,13 @@ def main():
     rng = jax.random.PRNGKey(925)
     x = jax.random.normal(rng, (bsz, seqlen, dim))
     freqs_cis = precompute_freqs_cis(128, seqlen)
-    self = Transformer(args)
-    variables = self.init(rng, tokens, 0)
-    self = self.bind(variables)
-    out = self.apply(variables, x, 0, freqs_cis, None)
+    model = Transformer(args)
+    variables = model.init(rng, tokens, 0)
+    model = model.bind(variables)
+    out, variable_updates = model.apply(variables, tokens, 0, mutable=["cache"])
 
-    layers = []
-    from time import sleep
-    for i in range(32):
-        print(f"layer {i}")
-        layer = TransformerBlock(i, args).init(rng, x, 0, freqs_cis, None)
-        layers.append(layer)
-        sleep(1)
+    pt_tokens = to_pytorch(tokens)
+    pt_model = PtTransformer(args)
+    fill_pytorch(pt_model, variables["params"])
+    pt_out = pt_model(pt_tokens, 0)
+    assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)

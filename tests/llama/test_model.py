@@ -5,7 +5,7 @@ from fairscale.nn.model_parallel.initialize import (
     initialize_model_parallel,
     model_parallel_is_initialized,
 )
-
+from gendo.llama.tokenizer import Tokenizer
 from gendo.llama.convert import to_jax, to_pytorch, fill_pytorch
 from gendo.llama.model import (
     precompute_freqs_cis,
@@ -18,6 +18,7 @@ from gendo.llama.model import (
     Attention,
     FeedForward,
     TransformerBlock,
+    Transformer,
 )
 
 
@@ -171,10 +172,6 @@ def test_transformerblock():
     bsz, seqlen, dim = (1, 5, args.dim)
     rng = jax.random.PRNGKey(925)
     x = jax.random.normal(rng, (bsz, seqlen, dim))
-    # cache = (
-    #     jnp.zeros((args.max_batch_size, args.max_seq_len, 32, 128)),
-    #     jnp.zeros((args.max_batch_size, args.max_seq_len, 32, 128)),
-    # )
     freqs_cis = precompute_freqs_cis(128, seqlen)
     block = TransformerBlock(0, args)
     variables = block.init(rng, x, 0, freqs_cis, None)
@@ -194,3 +191,29 @@ def test_transformerblock():
     assert jnp.allclose(
         to_jax(pt_block.attention.cache_v), variable_updates["cache"]["attention"]["cache_v"], atol=1e-2
     )
+
+
+def test_transformer():
+    from gendo.llama.tokenizer import Tokenizer
+    from gendo.llama.model_pt import Transformer as PtTransformer
+
+    init_pseudo_distributed()
+
+    args = ModelArgs(max_batch_size=1, max_seq_len=512)
+    tokenizer = Tokenizer(model_path="/data/llama/tokenizer.model")
+    args.vocab_size = tokenizer.n_words
+    tokens = tokenizer.encode("frankenstein walks into a bar", False, False)
+    tokens = jnp.asarray(tokens).reshape(1, -1)
+    # bsz, seqlen, dim = (*tokens.shape, args.dim)
+    rng = jax.random.PRNGKey(925)
+    # x = jax.random.normal(rng, (bsz, seqlen, dim))
+    model = Transformer(args)
+    variables = model.init(rng, tokens, 0)
+    model = model.bind(variables)
+    out, variable_updates = model.apply(variables, tokens, 0, mutable=["cache"])
+
+    pt_tokens = to_pytorch(tokens)
+    pt_model = PtTransformer(args)
+    fill_pytorch(pt_model, variables["params"])
+    pt_out = pt_model(pt_tokens, 0)
+    assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)
