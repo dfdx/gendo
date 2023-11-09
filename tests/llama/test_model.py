@@ -6,7 +6,7 @@ from fairscale.nn.model_parallel.initialize import (
     model_parallel_is_initialized,
 )
 from gendo.llama.tokenizer import Tokenizer
-from gendo.llama.convert import to_jax, to_pytorch, fill_pytorch
+from gendo.llama.convert import pt2jax, jax2pt, fill_pytorch
 from gendo.llama.model import (
     precompute_freqs_cis,
     view_as_complex,
@@ -40,9 +40,9 @@ def compare_with_pytorch(module, pt_module, rng, *args):
     variables = module.init(rng, *args)
     out = module.apply(variables, *args)
     # pytorch
-    pt_args = map(to_pytorch, args)
+    pt_args = map(jax2pt, args)
     pt_out = pt_module(*pt_args)
-    assert jnp.all(out == to_jax(pt_out))
+    assert jnp.all(out == pt2jax(pt_out))
 
 
 def test_rmsnorm():
@@ -59,7 +59,7 @@ def test_precompute_freqs_cis():
 
     res = precompute_freqs_cis(32, 8)
     pt_res = pt_precompute_freqs_cis(32, 8)
-    assert jnp.allclose(res, to_jax(pt_res))
+    assert jnp.allclose(res, pt2jax(pt_res))
 
 
 def test_complex_conversions():
@@ -69,10 +69,10 @@ def test_complex_conversions():
     x = jax.random.normal(rng, (4, 3, 2))
     cx = view_as_complex(x)
     assert jnp.all(x == view_as_real(cx))
-    pt_x = to_pytorch(x)
+    pt_x = jax2pt(x)
     pt_cx = torch.view_as_complex(pt_x)
-    assert jnp.all(cx == to_jax(pt_cx))
-    assert jnp.all(view_as_real(cx) == to_jax(torch.view_as_real(pt_cx)))
+    assert jnp.all(cx == pt2jax(pt_cx))
+    assert jnp.all(view_as_real(cx) == pt2jax(torch.view_as_real(pt_cx)))
 
 
 def test_apply_rotary_embeddings():
@@ -86,9 +86,9 @@ def test_apply_rotary_embeddings():
     freqs_cis = precompute_freqs_cis(dim, seq_len)
     out = apply_rotary_emb(xq, xk, freqs_cis)
     pt_out = pt_apply_rotary_embeddings(
-        to_pytorch(xq), to_pytorch(xk), to_pytorch(freqs_cis)
+        jax2pt(xq), jax2pt(xk), jax2pt(freqs_cis)
     )
-    assert jnp.allclose(out[0], to_jax(pt_out[0]))
+    assert jnp.allclose(out[0], pt2jax(pt_out[0]))
 
 
 def test_repeat_kv():
@@ -97,9 +97,9 @@ def test_repeat_kv():
     rng = jax.random.PRNGKey(134)
     x = jax.random.normal(rng, (5, 4, 3, 2))
     out = repeat_kv(x, 6)
-    pt_x = to_pytorch(x)
+    pt_x = jax2pt(x)
     pt_out = pt_repeat_kw(pt_x, 6)
-    assert jnp.allclose(out, to_jax(pt_out))
+    assert jnp.allclose(out, pt2jax(pt_out))
 
 
 def test_attention():
@@ -120,19 +120,19 @@ def test_attention():
     pt_attn = PtAttention(args)
     # fill_from_jax(pt_attn, variables["params"])
     params = variables["params"]
-    pt_attn.wq.weight.data = to_pytorch(params["wq"]["kernel"].T)
-    pt_attn.wk.weight.data = to_pytorch(params["wk"]["kernel"].T)
-    pt_attn.wv.weight.data = to_pytorch(params["wv"]["kernel"].T)
-    pt_attn.wo.weight.data = to_pytorch(params["wo"]["kernel"].T)
-    pt_attn.cache_k = to_pytorch(variables["cache"]["cache_k"])
-    pt_attn.cache_v = to_pytorch(variables["cache"]["cache_v"])
+    pt_attn.wq.weight.data = jax2pt(params["wq"]["kernel"].T)
+    pt_attn.wk.weight.data = jax2pt(params["wk"]["kernel"].T)
+    pt_attn.wv.weight.data = jax2pt(params["wv"]["kernel"].T)
+    pt_attn.wo.weight.data = jax2pt(params["wo"]["kernel"].T)
+    pt_attn.cache_k = jax2pt(variables["cache"]["cache_k"])
+    pt_attn.cache_v = jax2pt(variables["cache"]["cache_v"])
 
-    pt_x = to_pytorch(x)
-    pt_freqs_cis = to_pytorch(freqs_cis)
+    pt_x = jax2pt(x)
+    pt_freqs_cis = jax2pt(freqs_cis)
     pt_out = pt_attn(pt_x, 0, pt_freqs_cis, None)
-    assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)
-    assert jnp.allclose(to_jax(pt_attn.cache_k), variable_updates["cache"]["cache_k"], atol=1e-2)
-    assert jnp.allclose(to_jax(pt_attn.cache_v), variables["cache"]["cache_v"], atol=1e-2)
+    assert jnp.allclose(pt2jax(pt_out), out, atol=1e-2)
+    assert jnp.allclose(pt2jax(pt_attn.cache_k), variable_updates["cache"]["cache_k"], atol=1e-2)
+    assert jnp.allclose(pt2jax(pt_attn.cache_v), variables["cache"]["cache_v"], atol=1e-2)
 
 
 def test_feedforward():
@@ -154,13 +154,13 @@ def test_feedforward():
         args.dim, args.dim // 2, args.multiple_of, args.ffn_dim_multiplier
     )
     params = variables["params"]
-    pt_ff.w1.weight.data = to_pytorch(params["w1"]["kernel"].T)
-    pt_ff.w2.weight.data = to_pytorch(params["w2"]["kernel"].T)
-    pt_ff.w3.weight.data = to_pytorch(params["w3"]["kernel"].T)
+    pt_ff.w1.weight.data = jax2pt(params["w1"]["kernel"].T)
+    pt_ff.w2.weight.data = jax2pt(params["w2"]["kernel"].T)
+    pt_ff.w3.weight.data = jax2pt(params["w3"]["kernel"].T)
 
-    pt_x = to_pytorch(x)
+    pt_x = jax2pt(x)
     pt_out = pt_ff(pt_x)
-    assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)
+    assert jnp.allclose(pt2jax(pt_out), out, atol=1e-2)
 
 
 def test_transformerblock():
@@ -178,18 +178,17 @@ def test_transformerblock():
     out, variable_updates = block.apply(variables, x, 0, freqs_cis, None, mutable=["cache"])
 
     pt_block = PtTransformerBlock(0, args)
-    # fill_from_jax(pt_attn, variables["params"])
     fill_pytorch(pt_block, variables["params"])
 
-    pt_x = to_pytorch(x)
-    pt_freqs_cis = to_pytorch(freqs_cis)
+    pt_x = jax2pt(x)
+    pt_freqs_cis = jax2pt(freqs_cis)
     pt_out = pt_block(pt_x, 0, pt_freqs_cis, None)
-    assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)
+    assert jnp.allclose(pt2jax(pt_out), out, atol=1e-2)
     assert jnp.allclose(
-        to_jax(pt_block.attention.cache_k), variable_updates["cache"]["attention"]["cache_k"], atol=1e-2
+        pt2jax(pt_block.attention.cache_k), variable_updates["cache"]["attention"]["cache_k"], atol=1e-2
     )
     assert jnp.allclose(
-        to_jax(pt_block.attention.cache_v), variable_updates["cache"]["attention"]["cache_v"], atol=1e-2
+        pt2jax(pt_block.attention.cache_v), variable_updates["cache"]["attention"]["cache_v"], atol=1e-2
     )
 
 
@@ -204,16 +203,14 @@ def test_transformer():
     args.vocab_size = tokenizer.n_words
     tokens = tokenizer.encode("frankenstein walks into a bar", False, False)
     tokens = jnp.asarray(tokens).reshape(1, -1)
-    # bsz, seqlen, dim = (*tokens.shape, args.dim)
     rng = jax.random.PRNGKey(925)
-    # x = jax.random.normal(rng, (bsz, seqlen, dim))
     model = Transformer(args)
     variables = model.init(rng, tokens, 0)
     model = model.bind(variables)
-    out, variable_updates = model.apply(variables, tokens, 0, mutable=["cache"])
+    out, _variable_updates = model.apply(variables, tokens, 0, mutable=["cache"])
 
-    pt_tokens = to_pytorch(tokens)
+    pt_tokens = jax2pt(tokens)
     pt_model = PtTransformer(args)
     fill_pytorch(pt_model, variables["params"])
     pt_out = pt_model(pt_tokens, 0)
-    assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)
+    assert jnp.allclose(pt2jax(pt_out), out, atol=1e-2)
