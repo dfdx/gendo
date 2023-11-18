@@ -166,7 +166,6 @@ def apply_rotary_emb(
 
 
 def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, n_kv_heads, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -186,12 +185,12 @@ class Attention(nn.Module):
         n_kv_heads (int): Number of key and value heads.
         n_rep (int): Number of repetitions for local heads.
         head_dim (int): Dimension size of each attention head.
-        wq (ColumnParallelLinear): Linear transformation for queries.
-        wk (ColumnParallelLinear): Linear transformation for keys.
-        wv (ColumnParallelLinear): Linear transformation for values.
-        wo (RowParallelLinear): Linear transformation for output.
-        cache_k (torch.Tensor): Cached keys for attention.
-        cache_v (torch.Tensor): Cached values for attention.
+        wq (Dense): Linear transformation for queries.
+        wk (Dense): Linear transformation for keys.
+        wv (Dense): Linear transformation for values.
+        wo (Dense): Linear transformation for output.
+        cache_k (jax.Array): Cached keys for attention.
+        cache_v (jax.Array): Cached values for attention.
     """
 
     args: ModelArgs
@@ -234,6 +233,7 @@ class Attention(nn.Module):
                 self.n_kv_heads,
                 self.head_dim,
             ),
+            jnp.bfloat16,
         )
         self.cache_v = self.variable(
             "cache",
@@ -245,6 +245,7 @@ class Attention(nn.Module):
                 self.n_kv_heads,
                 self.head_dim,
             ),
+            jnp.bfloat16,
         )
 
     def __call__(
@@ -266,7 +267,7 @@ class Attention(nn.Module):
         Returns:
             jax.Array: Output array after attention.
         """
-
+        print(f"Attention: x.device() = {x.device()}")
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -275,6 +276,9 @@ class Attention(nn.Module):
         xv = xv.reshape(bsz, seqlen, self.n_kv_heads, self.head_dim)
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        self.cache_k.value = self.cache_k.value.astype(xq.dtype)
+        self.cache_v.value = self.cache_v.value.astype(xq.dtype)
 
         self.cache_k.value = self.cache_k.value.at[:bsz, start_pos : start_pos + seqlen].set(xk)
         self.cache_v.value = self.cache_v.value.at[:bsz, start_pos : start_pos + seqlen].set(xv)
@@ -299,6 +303,7 @@ class Attention(nn.Module):
         scores = nn.softmax(scores.astype("float32"), axis=-1).astype(xq.dtype)
         output = jnp.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = jnp.moveaxis(output, 1, 2).ravel().reshape(bsz, seqlen, -1)
+        print(f"Attention: output.device() = {output.device()}")
         return self.wo(output)
 
 
@@ -407,10 +412,12 @@ class TransformerBlock(nn.Module):
             jax.Array: Output tensor after applying attention and feedforward layers.
 
         """
+        print(f"FeedForward: x.device() = {x.device()}")
         h = x + self.attention(
             self.attention_norm(x), start_pos, freqs_cis, mask
         )
         out = h + self.feed_forward(self.ffn_norm(h))
+        print(f"FeedForward: out.device() = {out.device()}")
         return out
 
 
@@ -499,17 +506,17 @@ def main():
     args.vocab_size = tokenizer.n_words
     tokens = tokenizer.encode("frankenstein walks into a bar", False, False)
     tokens = jnp.asarray(tokens).reshape(1, -1)
-    bsz, seqlen, dim = (*tokens.shape, args.dim)
     rng = jax.random.PRNGKey(925)
-    x = jax.random.normal(rng, (bsz, seqlen, dim))
-    freqs_cis = precompute_freqs_cis(128, seqlen)
     model = Transformer(args)
     variables = model.init(rng, tokens, 0)
+    variables = tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), variables)
     model = model.bind(variables)
-    out, variable_updates = model.apply(variables, tokens, 0, mutable=["cache"])
+    with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
+        logits, variable_updates = model.apply(variables, tokens, 0, mutable=["cache"])
+        logits.block_until_ready()
 
     pt_tokens = to_pytorch(tokens)
     pt_model = PtTransformer(args)
     fill_pytorch(pt_model, variables["params"])
     pt_out = pt_model(pt_tokens, 0)
-    assert jnp.allclose(to_jax(pt_out), out, atol=1e-2)
+    assert jnp.allclose(to_jax(pt_out), logits, atol=1e-2)
