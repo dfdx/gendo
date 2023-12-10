@@ -1,11 +1,14 @@
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
+from functools import partial
 
+import numpy as np
 import jax
 import jax.tree_util as tree_util
 import jax.numpy as jnp
 import flax.linen as nn
+import flax.struct as struct
 
 
 @dataclass
@@ -76,6 +79,7 @@ def polar(r, theta):
     return r * jnp.exp(1j * theta)
 
 
+@partial(jax.jit, static_argnums=[0, 1])
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     """
     Precompute the frequency array for complex exponentials (cis) with given dimensions.
@@ -267,7 +271,6 @@ class Attention(nn.Module):
         Returns:
             jax.Array: Output array after attention.
         """
-        print(f"Attention: x.device() = {x.device()}")
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -275,7 +278,7 @@ class Attention(nn.Module):
         xk = xk.reshape(bsz, seqlen, self.n_kv_heads, self.head_dim)
         xv = xv.reshape(bsz, seqlen, self.n_kv_heads, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis[start_pos : start_pos + x.shape[-2]])
 
         self.cache_k.value = self.cache_k.value.astype(xq.dtype)
         self.cache_v.value = self.cache_v.value.astype(xq.dtype)
@@ -303,7 +306,6 @@ class Attention(nn.Module):
         scores = nn.softmax(scores.astype("float32"), axis=-1).astype(xq.dtype)
         output = jnp.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = jnp.moveaxis(output, 1, 2).ravel().reshape(bsz, seqlen, -1)
-        print(f"Attention: output.device() = {output.device()}")
         return self.wo(output)
 
 
@@ -412,12 +414,10 @@ class TransformerBlock(nn.Module):
             jax.Array: Output tensor after applying attention and feedforward layers.
 
         """
-        print(f"FeedForward: x.device() = {x.device()}")
         h = x + self.attention(
             self.attention_norm(x), start_pos, freqs_cis, mask
         )
         out = h + self.feed_forward(self.ffn_norm(h))
-        print(f"FeedForward: out.device() = {out.device()}")
         return out
 
 
@@ -435,11 +435,11 @@ class Transformer(nn.Module):
             params (ModelArgs): Model configuration parameters.
             vocab_size (int): Vocabulary size.
             n_layers (int): Number of layers in the model.
-            tok_embeddings (ParallelEmbedding): Token embeddings.
-            layers (torch.nn.ModuleList): List of Transformer blocks.
+            tok_embeddings (nn.Embed): Token embeddings.
+            layers (list): List of Transformer blocks.
             norm (RMSNorm): Layer normalization for the model output.
-            output (ColumnParallelLinear): Linear layer for final output.
-            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
+            output (nn.Dense): Linear layer for final output.
+            freqs_cis (jax.Array): Precomputed cosine and sine frequencies.
 
         """
         self.vocab_size = self.args.vocab_size
@@ -475,15 +475,17 @@ class Transformer(nn.Module):
         """
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        # self.freqs_cis = self.freqs_cis.to(h.device)
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        # freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None
         if seqlen > 1:
             mask = jnp.full((1, 1, seqlen, seqlen), float("-inf"))
+            # mask = jnp.triu(mask, k=start_pos + 1).astype(h.dtype)
             mask = jnp.triu(mask, k=start_pos + 1).astype(h.dtype)
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            # note: unlike PyTorch implementation, we pass the full freqs_cis array
+            # and take subarray later to avoid JIT errors due to dynamic shape
+            h = layer(h, start_pos, self.freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h).astype("float32")
         return output
@@ -498,6 +500,7 @@ def size_gb(variables: dict):
 def main():
     from gendo.llama.tokenizer import Tokenizer
     from gendo.llama.model_pt import Transformer as PtTransformer
+    from tests.llama.test_model import init_pseudo_distributed, jax2pt
 
     init_pseudo_distributed()
 
@@ -510,13 +513,70 @@ def main():
     model = Transformer(args)
     variables = model.init(rng, tokens, 0)
     variables = tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), variables)
-    model = model.bind(variables)
-    with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
-        logits, variable_updates = model.apply(variables, tokens, 0, mutable=["cache"])
-        logits.block_until_ready()
+    # model = model.bind(variables)
+    jit_apply = partial(jax.jit, static_argnums=(2,), static_argnames=("mutable",))(model.apply)
+    logits, variable_updates = jit_apply(variables, tokens, 0, mutable=("cache",))
 
-    pt_tokens = to_pytorch(tokens)
+
+    pt_tokens = jax2pt(tokens)
     pt_model = PtTransformer(args)
     fill_pytorch(pt_model, variables["params"])
     pt_out = pt_model(pt_tokens, 0)
     assert jnp.allclose(to_jax(pt_out), logits, atol=1e-2)
+
+
+def gpu_test():
+    MODEL_ARGS = ModelArgs(max_batch_size=1, max_seq_len=512)
+    from gendo.llama.model_pt import FeedForward as PtFeedForward
+    from tests.llama.test_model import init_pseudo_distributed, jax2pt
+
+    init_pseudo_distributed()
+
+    args = MODEL_ARGS
+    bsz, seqlen, dim = (1, 5, args.dim)
+    rng = jax.random.PRNGKey(925)
+    x = jax.random.normal(rng, (bsz, seqlen, dim))
+
+    # freqs_cis = precompute_freqs_cis(128, seqlen)
+    ff = FeedForward(args.dim, args.dim // 2, args.multiple_of, args.ffn_dim_multiplier)
+    variables = ff.init(rng, x)
+    out = ff.apply(variables, x)
+
+    pt_ff = PtFeedForward(
+        args.dim, args.dim // 2, args.multiple_of, args.ffn_dim_multiplier
+    )
+    params = variables["params"]
+    pt_ff.w1.weight.data = jax2pt(params["w1"]["kernel"].T)
+    pt_ff.w2.weight.data = jax2pt(params["w2"]["kernel"].T)
+    pt_ff.w3.weight.data = jax2pt(params["w3"]["kernel"].T)
+
+    pt_x = jax2pt(x)
+    pt_out = pt_ff(pt_x)
+
+    import jax
+    rng = jax.random.PRNGKey(0)
+    x = jax.random.normal(rng, (8, 4096))
+    w = jax.random.normal(rng, (4096, 1024))
+    x.device()    # cuda(id=0)
+    w.device()    # cuda(id=0)
+
+    import torch
+    pt_x = torch.randn((8, 4096)).to(torch.device("cuda"))
+    pt_w = torch.randn((4096, 1024)).to(torch.device("cuda"))
+
+    import timeit
+    N = 10_000
+    timeit.timeit(lambda: (x @ w).block_until_ready(), number=N)   # 0.95
+    timeit.timeit(lambda: pt_x @ pt_w, number=N)                   # 0.24
+
+    import flax.linen as nn
+    dense = nn.Dense(1024, use_bias=False)
+    variables = dense.init(rng, x)
+    jax.tree_util.tree_leaves(variables)[0].device()               # cuda(id=0)
+    timeit.timeit(lambda: dense.apply(variables, x).block_until_ready(), number=N)  # 25.1
+
+    import torch.nn as tnn
+    pt_dense = tnn.Linear(4096, 1024, bias=False).to(torch.device("cuda"))
+    timeit.timeit(lambda: pt_dense(pt_x), number=N)                                 # 0.3
+
+

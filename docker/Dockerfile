@@ -1,5 +1,6 @@
 # devel version with DNN is required for JIT compilation in some cases
-FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04 AS build-base
+# FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04 AS build-base
+FROM nvidia/cuda:12.0.1-cudnn8-devel-ubuntu22.04 AS build-base
 
 
 SHELL ["/bin/bash", "-c"]
