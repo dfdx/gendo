@@ -3,12 +3,10 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 from functools import partial
 
-import numpy as np
 import jax
 import jax.tree_util as tree_util
 import jax.numpy as jnp
 import flax.linen as nn
-import flax.struct as struct
 
 
 @dataclass
@@ -480,7 +478,6 @@ class Transformer(nn.Module):
         mask = None
         if seqlen > 1:
             mask = jnp.full((1, 1, seqlen, seqlen), float("-inf"))
-            # mask = jnp.triu(mask, k=start_pos + 1).astype(h.dtype)
             mask = jnp.triu(mask, k=start_pos + 1).astype(h.dtype)
         for layer in self.layers:
             # note: unlike PyTorch implementation, we pass the full freqs_cis array
@@ -489,94 +486,3 @@ class Transformer(nn.Module):
         h = self.norm(h)
         output = self.output(h).astype("float32")
         return output
-
-
-def size_gb(variables: dict):
-    from math import prod
-    bytes = sum([prod(x.shape) * 4 for x in tree_util.tree_leaves(variables)])
-    return bytes / (1024 ** 3)
-
-
-def main():
-    from gendo.llama.tokenizer import Tokenizer
-    from gendo.llama.model_pt import Transformer as PtTransformer
-    from tests.llama.test_model import init_pseudo_distributed, jax2pt
-
-    init_pseudo_distributed()
-
-    args = ModelArgs(max_batch_size=1, max_seq_len=512)
-    tokenizer = Tokenizer(model_path="/data/llama/tokenizer.model")
-    args.vocab_size = tokenizer.n_words
-    tokens = tokenizer.encode("frankenstein walks into a bar", False, False)
-    tokens = jnp.asarray(tokens).reshape(1, -1)
-    rng = jax.random.PRNGKey(925)
-    model = Transformer(args)
-    variables = model.init(rng, tokens, 0)
-    variables = tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), variables)
-    # model = model.bind(variables)
-    jit_apply = partial(jax.jit, static_argnums=(2,), static_argnames=("mutable",))(model.apply)
-    logits, variable_updates = jit_apply(variables, tokens, 0, mutable=("cache",))
-
-
-    pt_tokens = jax2pt(tokens)
-    pt_model = PtTransformer(args)
-    fill_pytorch(pt_model, variables["params"])
-    pt_out = pt_model(pt_tokens, 0)
-    assert jnp.allclose(to_jax(pt_out), logits, atol=1e-2)
-
-
-def gpu_test():
-    MODEL_ARGS = ModelArgs(max_batch_size=1, max_seq_len=512)
-    from gendo.llama.model_pt import FeedForward as PtFeedForward
-    from tests.llama.test_model import init_pseudo_distributed, jax2pt
-
-    init_pseudo_distributed()
-
-    args = MODEL_ARGS
-    bsz, seqlen, dim = (1, 5, args.dim)
-    rng = jax.random.PRNGKey(925)
-    x = jax.random.normal(rng, (bsz, seqlen, dim))
-
-    # freqs_cis = precompute_freqs_cis(128, seqlen)
-    ff = FeedForward(args.dim, args.dim // 2, args.multiple_of, args.ffn_dim_multiplier)
-    variables = ff.init(rng, x)
-    out = ff.apply(variables, x)
-
-    pt_ff = PtFeedForward(
-        args.dim, args.dim // 2, args.multiple_of, args.ffn_dim_multiplier
-    )
-    params = variables["params"]
-    pt_ff.w1.weight.data = jax2pt(params["w1"]["kernel"].T)
-    pt_ff.w2.weight.data = jax2pt(params["w2"]["kernel"].T)
-    pt_ff.w3.weight.data = jax2pt(params["w3"]["kernel"].T)
-
-    pt_x = jax2pt(x)
-    pt_out = pt_ff(pt_x)
-
-    import jax
-    rng = jax.random.PRNGKey(0)
-    x = jax.random.normal(rng, (8, 4096))
-    w = jax.random.normal(rng, (4096, 1024))
-    x.device()    # cuda(id=0)
-    w.device()    # cuda(id=0)
-
-    import torch
-    pt_x = torch.randn((8, 4096)).to(torch.device("cuda"))
-    pt_w = torch.randn((4096, 1024)).to(torch.device("cuda"))
-
-    import timeit
-    N = 10_000
-    timeit.timeit(lambda: (x @ w).block_until_ready(), number=N)   # 0.95
-    timeit.timeit(lambda: pt_x @ pt_w, number=N)                   # 0.24
-
-    import flax.linen as nn
-    dense = nn.Dense(1024, use_bias=False)
-    variables = dense.init(rng, x)
-    jax.tree_util.tree_leaves(variables)[0].device()               # cuda(id=0)
-    timeit.timeit(lambda: dense.apply(variables, x).block_until_ready(), number=N)  # 25.1
-
-    import torch.nn as tnn
-    pt_dense = tnn.Linear(4096, 1024, bias=False).to(torch.device("cuda"))
-    timeit.timeit(lambda: pt_dense(pt_x), number=N)                                 # 0.3
-
-
