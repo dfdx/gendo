@@ -2,4 +2,4 @@
 
 ![logo](logo/gendo.jpg)
 
-Generative models
+Generative models in JAX. Work in progress.
